@@ -1,5 +1,4 @@
 import os
-from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from urllib.parse import urlsplit
 
@@ -13,7 +12,7 @@ from ._registry import is_model, model_entrypoint, split_model_name_tag
 __all__ = ['parse_model_name', 'safe_model_name', 'create_model']
 
 
-def parse_model_name(model_name: str):
+def parse_model_name(model_name):
     if model_name.startswith('hf_hub'):
         # NOTE for backwards compat, deprecate hf_hub use
         model_name = model_name.replace('hf_hub', 'hf-hub')
@@ -27,7 +26,7 @@ def parse_model_name(model_name: str):
         return 'timm', model_name
 
 
-def safe_model_name(model_name: str, remove_source: bool = True):
+def safe_model_name(model_name, remove_source=True):
     # return a filename / path safe model name
     def make_safe(name):
         return ''.join(c if c.isalnum() else '_' for c in name).rstrip('_')
@@ -41,59 +40,33 @@ def create_model(
         pretrained: bool = False,
         pretrained_cfg: Optional[Union[str, Dict[str, Any], PretrainedCfg]] = None,
         pretrained_cfg_overlay:  Optional[Dict[str, Any]] = None,
-        checkpoint_path: Optional[Union[str, Path]] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
+        checkpoint_path: str = '',
         scriptable: Optional[bool] = None,
         exportable: Optional[bool] = None,
         no_jit: Optional[bool] = None,
         **kwargs,
 ):
-    """Create a model.
+    """Create a model
 
     Lookup model's entrypoint function and pass relevant args to create a new model.
 
-    Tip:
-        **kwargs will be passed through entrypoint fn to ``timm.models.build_model_with_cfg()``
-        and then the model class __init__(). kwargs values set to None are pruned before passing.
+    **kwargs will be passed through entrypoint fn to timm.models.build_model_with_cfg()
+    and then the model class __init__(). kwargs values set to None are pruned before passing.
 
     Args:
-        model_name: Name of model to instantiate.
-        pretrained: If set to `True`, load pretrained ImageNet-1k weights.
-        pretrained_cfg: Pass in an external pretrained_cfg for model.
-        pretrained_cfg_overlay: Replace key-values in base pretrained_cfg with these.
-        checkpoint_path: Path of checkpoint to load _after_ the model is initialized.
-        cache_dir: Override model cache dir for Hugging Face Hub and Torch checkpoints.
-        scriptable: Set layer config so that model is jit scriptable (not working for all models yet).
-        exportable: Set layer config so that model is traceable / ONNX exportable (not fully impl/obeyed yet).
-        no_jit: Set layer config so that model doesn't utilize jit scripted layers (so far activations only).
+        model_name (str): name of model to instantiate
+        pretrained (bool): load pretrained ImageNet-1k weights if true
+        pretrained_cfg (Union[str, dict, PretrainedCfg]): pass in external pretrained_cfg for model
+        pretrained_cfg_overlay (dict): replace key-values in base pretrained_cfg with these
+        checkpoint_path (str): path of checkpoint to load _after_ the model is initialized
+        scriptable (bool): set layer config so that model is jit scriptable (not working for all models yet)
+        exportable (bool): set layer config so that model is traceable / ONNX exportable (not fully impl/obeyed yet)
+        no_jit (bool): set layer config so that model doesn't utilize jit scripted layers (so far activations only)
 
     Keyword Args:
-        drop_rate (float): Classifier dropout rate for training.
-        drop_path_rate (float): Stochastic depth drop rate for training.
-        global_pool (str): Classifier global pooling type.
-
-    Example:
-
-    ```py
-    >>> from timm import create_model
-
-    >>> # Create a MobileNetV3-Large model with no pretrained weights.
-    >>> model = create_model('mobilenetv3_large_100')
-
-    >>> # Create a MobileNetV3-Large model with pretrained weights.
-    >>> model = create_model('mobilenetv3_large_100', pretrained=True)
-    >>> model.num_classes
-    1000
-
-    >>> # Create a MobileNetV3-Large model with pretrained weights and a new head with 10 classes.
-    >>> model = create_model('mobilenetv3_large_100', pretrained=True, num_classes=10)
-    >>> model.num_classes
-    10
-
-    >>> # Create a Dinov2 small model with pretrained weights and save weights in a custom directory.
-    >>> model = create_model('vit_small_patch14_dinov2.lvd142m', pretrained=True, cache_dir="/data/my-models")
-    >>> # Data will be stored at `/data/my-models/models--timm--vit_small_patch14_dinov2.lvd142m/`
-    ```
+        drop_rate (float): dropout rate for training (default: 0.0)
+        global_pool (str): global pool type (default: 'avg')
+        **: other kwargs are consumed by builder or model __init__()
     """
     # Parameters that aren't supported by all models or are intended to only override model defaults if set
     # should default to None in command line args/cfg. Remove them if they are present and not set so that
@@ -105,13 +78,7 @@ def create_model(
         assert not pretrained_cfg, 'pretrained_cfg should not be set when sourcing model from Hugging Face Hub.'
         # For model names specified in the form `hf-hub:path/architecture_name@revision`,
         # load model weights + pretrained_cfg from Hugging Face hub.
-        pretrained_cfg, model_name, model_args = load_model_config_from_hf(
-            model_name,
-            cache_dir=cache_dir,
-        )
-        if model_args:
-            for k, v in model_args.items():
-                kwargs.setdefault(k, v)
+        pretrained_cfg, model_name = load_model_config_from_hf(model_name)
     else:
         model_name, pretrained_tag = split_model_name_tag(model_name)
         if pretrained_tag and not pretrained_cfg:
@@ -127,7 +94,6 @@ def create_model(
             pretrained=pretrained,
             pretrained_cfg=pretrained_cfg,
             pretrained_cfg_overlay=pretrained_cfg_overlay,
-            cache_dir=cache_dir,
             **kwargs,
         )
 

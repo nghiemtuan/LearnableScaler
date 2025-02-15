@@ -4,7 +4,6 @@ Originally from torchvision Inception3 model
 Licensed BSD-Clause 3 https://github.com/pytorch/vision/blob/master/LICENSE
 """
 from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -294,7 +293,7 @@ class InceptionV3(nn.Module):
             dict(num_chs=2048, reduction=32, module='Mixed_7c'),
         ]
 
-        self.num_features = self.head_hidden_size = 2048
+        self.num_features = 2048
         self.global_pool, self.head_drop, self.fc = create_classifier(
             self.num_features,
             self.num_classes,
@@ -332,10 +331,10 @@ class InceptionV3(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool)
 
@@ -372,11 +371,9 @@ class InceptionV3(nn.Module):
         x = self.forward_postaux(x)
         return x
 
-    def forward_head(self, x, pre_logits: bool = False):
+    def forward_head(self, x):
         x = self.global_pool(x)
         x = self.head_drop(x)
-        if pre_logits:
-            return x
         x = self.fc(x)
         return x
 
@@ -431,14 +428,21 @@ default_cfgs = generate_default_cfgs({
         hf_hub_id='timm/',
         url='https://download.pytorch.org/models/inception_v3_google-1a9a5a14.pth'),
     # my port of Tensorflow SLIM weights (http://download.tensorflow.org/models/inception_v3_2016_08_28.tar.gz)
-    'inception_v3.tf_in1k': _cfg(hf_hub_id='timm/'),
+    'inception_v3.tf_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/tf_inception_v3-e0069de4.pth',
+        num_classes=1000, label_offset=1),
     # my port of Tensorflow adversarially trained Inception V3 from
     # http://download.tensorflow.org/models/adv_inception_v3_2017_08_18.tar.gz
-    'inception_v3.tf_adv_in1k': _cfg(hf_hub_id='timm/'),
+    'inception_v3.tf_adv_in1k': _cfg(
+        hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/adv_inception_v3-9e27bd63.pth',
+        num_classes=1000, label_offset=1),
     # from gluon pretrained models, best performing in terms of accuracy/loss metrics
     # https://gluon-cv.mxnet.io/model_zoo/classification.html
     'inception_v3.gluon_in1k': _cfg(
         hf_hub_id='timm/',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/gluon_inception_v3-9f746940.pth',
         mean=IMAGENET_DEFAULT_MEAN,  # also works well with inception defaults
         std=IMAGENET_DEFAULT_STD,  # also works well with inception defaults
     )
@@ -446,7 +450,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def inception_v3(pretrained=False, **kwargs) -> InceptionV3:
+def inception_v3(pretrained=False, **kwargs):
     model = _create_inception_v3('inception_v3', pretrained=pretrained, **kwargs)
     return model
 

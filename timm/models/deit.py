@@ -11,15 +11,14 @@ Modifications copyright 2021, Ross Wightman
 # Copyright (c) 2015-present, Facebook, Inc.
 # All rights reserved.
 from functools import partial
-from typing import Optional
 
 import torch
 from torch import nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import resample_abs_pos_embed
 from timm.models.vision_transformer import VisionTransformer, trunc_normal_, checkpoint_filter_fn
 from ._builder import build_model_with_cfg
+from ._manipulate import checkpoint_seq
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
 
 __all__ = ['VisionTransformerDistilled']  # model_registry will add each entrypoint fn to this
@@ -60,10 +59,10 @@ class VisionTransformerDistilled(VisionTransformer):
         )
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head, self.head_dist
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
         self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
@@ -72,38 +71,19 @@ class VisionTransformerDistilled(VisionTransformer):
     def set_distilled_training(self, enable=True):
         self.distilled_training = enable
 
-    def _pos_embed(self, x):
-        if self.dynamic_img_size:
-            B, H, W, C = x.shape
-            prev_grid_size = self.patch_embed.grid_size
-            pos_embed = resample_abs_pos_embed(
-                self.pos_embed,
-                new_size=(H, W),
-                old_size=prev_grid_size,
-                num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
-            )
-            x = x.view(B, -1, C)
+    def forward_features(self, x) -> torch.Tensor:
+        x = self.patch_embed(x)
+        x = torch.cat((
+            self.cls_token.expand(x.shape[0], -1, -1),
+            self.dist_token.expand(x.shape[0], -1, -1), x),
+            dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            x = checkpoint_seq(self.blocks, x)
         else:
-            pos_embed = self.pos_embed
-        if self.no_embed_class:
-            # deit-3, updated JAX (big vision)
-            # position embedding does not overlap with class token, add then concat
-            x = x + pos_embed
-            x = torch.cat((
-                self.cls_token.expand(x.shape[0], -1, -1),
-                self.dist_token.expand(x.shape[0], -1, -1),
-                x),
-                dim=1)
-        else:
-            # original timm, JAX, and deit vit impl
-            # pos_embed has entry for class token, concat then add
-            x = torch.cat((
-                self.cls_token.expand(x.shape[0], -1, -1),
-                self.dist_token.expand(x.shape[0], -1, -1),
-                x),
-                dim=1)
-            x = x + pos_embed
-        return self.pos_drop(x)
+            x = self.blocks(x)
+        x = self.norm(x)
+        return x
 
     def forward_head(self, x, pre_logits: bool = False) -> torch.Tensor:
         x, x_dist = x[:, 0], x[:, 1]
@@ -120,14 +100,14 @@ class VisionTransformerDistilled(VisionTransformer):
 
 
 def _create_deit(variant, pretrained=False, distilled=False, **kwargs):
-    out_indices = kwargs.pop('out_indices', 3)
+    if kwargs.get('features_only', None):
+        raise RuntimeError('features_only not implemented for Vision Transformer models.')
     model_cls = VisionTransformerDistilled if distilled else VisionTransformer
     model = build_model_with_cfg(
         model_cls,
         variant,
         pretrained,
         pretrained_filter_fn=partial(checkpoint_filter_fn, adapt_layer_scale=True),
-        feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
         **kwargs,
     )
     return model
@@ -242,7 +222,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def deit_tiny_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit_tiny_patch16_224(pretrained=False, **kwargs):
     """ DeiT-tiny model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -252,7 +232,7 @@ def deit_tiny_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit_small_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit_small_patch16_224(pretrained=False, **kwargs):
     """ DeiT-small model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -262,7 +242,7 @@ def deit_small_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit_base_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit_base_patch16_224(pretrained=False, **kwargs):
     """ DeiT base model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -272,7 +252,7 @@ def deit_base_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit_base_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
+def deit_base_patch16_384(pretrained=False, **kwargs):
     """ DeiT base model @ 384x384 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -282,7 +262,7 @@ def deit_base_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit_tiny_distilled_patch16_224(pretrained=False, **kwargs) -> VisionTransformerDistilled:
+def deit_tiny_distilled_patch16_224(pretrained=False, **kwargs):
     """ DeiT-tiny distilled model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -293,7 +273,7 @@ def deit_tiny_distilled_patch16_224(pretrained=False, **kwargs) -> VisionTransfo
 
 
 @register_model
-def deit_small_distilled_patch16_224(pretrained=False, **kwargs) -> VisionTransformerDistilled:
+def deit_small_distilled_patch16_224(pretrained=False, **kwargs):
     """ DeiT-small distilled model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -304,7 +284,7 @@ def deit_small_distilled_patch16_224(pretrained=False, **kwargs) -> VisionTransf
 
 
 @register_model
-def deit_base_distilled_patch16_224(pretrained=False, **kwargs) -> VisionTransformerDistilled:
+def deit_base_distilled_patch16_224(pretrained=False, **kwargs):
     """ DeiT-base distilled model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -315,7 +295,7 @@ def deit_base_distilled_patch16_224(pretrained=False, **kwargs) -> VisionTransfo
 
 
 @register_model
-def deit_base_distilled_patch16_384(pretrained=False, **kwargs) -> VisionTransformerDistilled:
+def deit_base_distilled_patch16_384(pretrained=False, **kwargs):
     """ DeiT-base distilled model @ 384x384 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -326,7 +306,7 @@ def deit_base_distilled_patch16_384(pretrained=False, **kwargs) -> VisionTransfo
 
 
 @register_model
-def deit3_small_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_small_patch16_224(pretrained=False, **kwargs):
     """ DeiT-3 small model @ 224x224 from paper (https://arxiv.org/abs/2204.07118).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -336,7 +316,7 @@ def deit3_small_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit3_small_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_small_patch16_384(pretrained=False, **kwargs):
     """ DeiT-3 small model @ 384x384 from paper (https://arxiv.org/abs/2204.07118).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -346,7 +326,7 @@ def deit3_small_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit3_medium_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_medium_patch16_224(pretrained=False, **kwargs):
     """ DeiT-3 medium model @ 224x224 (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -356,7 +336,7 @@ def deit3_medium_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit3_base_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_base_patch16_224(pretrained=False, **kwargs):
     """ DeiT-3 base model @ 224x224 from paper (https://arxiv.org/abs/2204.07118).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -366,7 +346,7 @@ def deit3_base_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit3_base_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_base_patch16_384(pretrained=False, **kwargs):
     """ DeiT-3 base model @ 384x384 from paper (https://arxiv.org/abs/2204.07118).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -376,7 +356,7 @@ def deit3_base_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit3_large_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_large_patch16_224(pretrained=False, **kwargs):
     """ DeiT-3 large model @ 224x224 from paper (https://arxiv.org/abs/2204.07118).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -386,7 +366,7 @@ def deit3_large_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit3_large_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_large_patch16_384(pretrained=False, **kwargs):
     """ DeiT-3 large model @ 384x384 from paper (https://arxiv.org/abs/2204.07118).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
@@ -396,7 +376,7 @@ def deit3_large_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def deit3_huge_patch14_224(pretrained=False, **kwargs) -> VisionTransformer:
+def deit3_huge_patch14_224(pretrained=False, **kwargs):
     """ DeiT-3 base model @ 384x384 from paper (https://arxiv.org/abs/2204.07118).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """

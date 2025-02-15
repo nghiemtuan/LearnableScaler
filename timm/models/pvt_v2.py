@@ -16,16 +16,16 @@ Modifications and timm support by / Copyright 2022, Ross Wightman
 """
 
 import math
-from typing import Callable, List, Optional, Union
+from typing import Tuple, List, Callable, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import DropPath, to_2tuple, to_ntuple, trunc_normal_, LayerNorm, use_fused_attn
 from ._builder import build_model_with_cfg
-from ._manipulate import checkpoint
 from ._registry import register_model, generate_default_cfgs
 
 __all__ = ['PyramidVisionTransformerV2']
@@ -130,7 +130,7 @@ class Attention(nn.Module):
         k, v = kv.unbind(0)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p)
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
@@ -338,7 +338,7 @@ class PyramidVisionTransformerV2(nn.Module):
         self.stages = nn.Sequential(*stages)
 
         # classification head
-        self.num_features = self.head_hidden_size = embed_dims[-1]
+        self.num_features = embed_dims[-1]
         self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(embed_dims[-1], num_classes) if num_classes > 0 else nn.Identity()
 
@@ -376,15 +376,15 @@ class PyramidVisionTransformerV2(nn.Module):
         for s in self.stages:
             s.grad_checkpointing = enable
 
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('avg', '')
             self.global_pool = global_pool
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -403,7 +403,7 @@ class PyramidVisionTransformerV2(nn.Module):
         return x
 
 
-def checkpoint_filter_fn(state_dict, model):
+def _checkpoint_filter_fn(state_dict, model):
     """ Remap original checkpoints -> timm """
     if 'patch_embed.proj.weight' in state_dict:
         return state_dict  # non-original checkpoint, no remapping needed
@@ -430,7 +430,7 @@ def _create_pvt2(variant, pretrained=False, **kwargs):
         PyramidVisionTransformerV2,
         variant,
         pretrained,
-        pretrained_filter_fn=checkpoint_filter_fn,
+        pretrained_filter_fn=_checkpoint_filter_fn,
         feature_cfg=dict(flatten_sequential=True, out_indices=out_indices),
         **kwargs,
     )
@@ -448,55 +448,55 @@ def _cfg(url='', **kwargs):
 
 
 default_cfgs = generate_default_cfgs({
-    'pvt_v2_b0.in1k': _cfg(hf_hub_id='timm/'),
-    'pvt_v2_b1.in1k': _cfg(hf_hub_id='timm/'),
-    'pvt_v2_b2.in1k': _cfg(hf_hub_id='timm/'),
-    'pvt_v2_b3.in1k': _cfg(hf_hub_id='timm/'),
-    'pvt_v2_b4.in1k': _cfg(hf_hub_id='timm/'),
-    'pvt_v2_b5.in1k': _cfg(hf_hub_id='timm/'),
-    'pvt_v2_b2_li.in1k': _cfg(hf_hub_id='timm/'),
+    'pvt_v2_b0': _cfg(hf_hub_id='timm/'),
+    'pvt_v2_b1': _cfg(hf_hub_id='timm/'),
+    'pvt_v2_b2': _cfg(hf_hub_id='timm/'),
+    'pvt_v2_b3': _cfg(hf_hub_id='timm/'),
+    'pvt_v2_b4': _cfg(hf_hub_id='timm/'),
+    'pvt_v2_b5': _cfg(hf_hub_id='timm/'),
+    'pvt_v2_b2_li': _cfg(hf_hub_id='timm/'),
 })
 
 
 @register_model
-def pvt_v2_b0(pretrained=False, **kwargs) -> PyramidVisionTransformerV2:
+def pvt_v2_b0(pretrained=False, **kwargs):
     model_args = dict(depths=(2, 2, 2, 2), embed_dims=(32, 64, 160, 256), num_heads=(1, 2, 5, 8))
     return _create_pvt2('pvt_v2_b0', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def pvt_v2_b1(pretrained=False, **kwargs) -> PyramidVisionTransformerV2:
+def pvt_v2_b1(pretrained=False, **kwargs):
     model_args = dict(depths=(2, 2, 2, 2), embed_dims=(64, 128, 320, 512), num_heads=(1, 2, 5, 8))
     return _create_pvt2('pvt_v2_b1', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def pvt_v2_b2(pretrained=False, **kwargs) -> PyramidVisionTransformerV2:
+def pvt_v2_b2(pretrained=False, **kwargs):
     model_args = dict(depths=(3, 4, 6, 3), embed_dims=(64, 128, 320, 512), num_heads=(1, 2, 5, 8))
     return _create_pvt2('pvt_v2_b2', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def pvt_v2_b3(pretrained=False, **kwargs) -> PyramidVisionTransformerV2:
+def pvt_v2_b3(pretrained=False, **kwargs):
     model_args = dict(depths=(3, 4, 18, 3), embed_dims=(64, 128, 320, 512), num_heads=(1, 2, 5, 8))
     return _create_pvt2('pvt_v2_b3', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def pvt_v2_b4(pretrained=False, **kwargs) -> PyramidVisionTransformerV2:
+def pvt_v2_b4(pretrained=False, **kwargs):
     model_args = dict(depths=(3, 8, 27, 3), embed_dims=(64, 128, 320, 512), num_heads=(1, 2, 5, 8))
     return _create_pvt2('pvt_v2_b4', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def pvt_v2_b5(pretrained=False, **kwargs) -> PyramidVisionTransformerV2:
+def pvt_v2_b5(pretrained=False, **kwargs):
     model_args = dict(
         depths=(3, 6, 40, 3), embed_dims=(64, 128, 320, 512), num_heads=(1, 2, 5, 8), mlp_ratios=(4, 4, 4, 4))
     return _create_pvt2('pvt_v2_b5', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def pvt_v2_b2_li(pretrained=False, **kwargs) -> PyramidVisionTransformerV2:
+def pvt_v2_b2_li(pretrained=False, **kwargs):
     model_args = dict(
         depths=(3, 4, 6, 3), embed_dims=(64, 128, 320, 512), num_heads=(1, 2, 5, 8), linear=True)
     return _create_pvt2('pvt_v2_b2_li', pretrained=pretrained, **dict(model_args, **kwargs))

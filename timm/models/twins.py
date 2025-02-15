@@ -13,7 +13,7 @@ Code/weights from https://github.com/Meituan-AutoML/Twins, original copyright/li
 # --------------------------------------------------------
 import math
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -22,7 +22,6 @@ import torch.nn.functional as F
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import Mlp, DropPath, to_2tuple, trunc_normal_, use_fused_attn
 from ._builder import build_model_with_cfg
-from ._features import feature_take_indices
 from ._features_fx import register_notrace_module
 from ._registry import register_model, generate_default_cfgs
 from .vision_transformer import Attention
@@ -76,7 +75,7 @@ class LocallyGroupedAttn(nn.Module):
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                dropout_p=self.attn_drop.p,
             )
         else:
             q = q * self.scale
@@ -173,7 +172,7 @@ class GlobalSubSampleAttn(nn.Module):
         if self.fused_attn:
             x = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                dropout_p=self.attn_drop.p,
             )
         else:
             q = q * self.scale
@@ -280,7 +279,7 @@ class PatchEmbed(nn.Module):
 
 
 class Twins(nn.Module):
-    """ Twins Vision Transformer (Revisiting Spatial Attention)
+    """ Twins Vision Transfomer (Revisiting Spatial Attention)
 
     Adapted from PVT (PyramidVisionTransformer) class at https://github.com/whai362/PVT.git
     """
@@ -310,7 +309,7 @@ class Twins(nn.Module):
         self.global_pool = global_pool
         self.depths = depths
         self.embed_dims = embed_dims
-        self.num_features = self.head_hidden_size = embed_dims[-1]
+        self.num_features = embed_dims[-1]
         self.grad_checkpointing = False
 
         img_size = to_2tuple(img_size)
@@ -325,7 +324,6 @@ class Twins(nn.Module):
             patch_size = 2
 
         self.blocks = nn.ModuleList()
-        self.feature_info = []
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
         cur = 0
         for k in range(len(depths)):
@@ -341,7 +339,6 @@ class Twins(nn.Module):
                 ws=1 if wss is None or i % 2 == 1 else wss[k]) for i in range(depths[k])],
             )
             self.blocks.append(_block)
-            self.feature_info += [dict(module=f'block.{k}', num_chs=embed_dims[k], reduction=2**(2+k))]
             cur += depths[k]
 
         self.pos_block = nn.ModuleList([PosConv(embed_dim, embed_dim) for embed_dim in embed_dims])
@@ -379,10 +376,10 @@ class Twins(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('', 'avg')
@@ -403,77 +400,6 @@ class Twins(nn.Module):
             m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
             if m.bias is not None:
                 m.bias.data.zero_()
-
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            indices: Optional[Union[int, List[int]]] = None,
-            norm: bool = False,
-            stop_early: bool = False,
-            output_fmt: str = 'NCHW',
-            intermediates_only: bool = False,
-    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            norm: Apply norm layer to all intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-        Returns:
-
-        """
-        assert output_fmt == 'NCHW', 'Output shape for Twins must be NCHW.'
-        intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
-
-        # FIXME slice block/pos_block if < max
-
-        # forward pass
-        B, _, height, width = x.shape
-        for i, (embed, drop, blocks, pos_blk) in enumerate(zip(
-                self.patch_embeds, self.pos_drops, self.blocks, self.pos_block)
-        ):
-            x, size = embed(x)
-            x = drop(x)
-            for j, blk in enumerate(blocks):
-                x = blk(x, size)
-                if j == 0:
-                    x = pos_blk(x, size)  # PEG here
-
-            if i < len(self.depths) - 1:
-                x = x.reshape(B, *size, -1).permute(0, 3, 1, 2).contiguous()
-                if i in take_indices:
-                    intermediates.append(x)
-            else:
-                if i in take_indices:
-                    # only last feature can be normed
-                    x_feat = self.norm(x) if norm else x
-                    intermediates.append(x_feat.reshape(B, *size, -1).permute(0, 3, 1, 2).contiguous())
-
-        if intermediates_only:
-            return intermediates
-
-        x = self.norm(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
-        # FIXME add block pruning
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
-            self.reset_classifier(0, '')
-        return take_indices
 
     def forward_features(self, x):
         B = x.shape[0]
@@ -503,12 +429,10 @@ class Twins(nn.Module):
 
 
 def _create_twins(variant, pretrained=False, **kwargs):
-    out_indices = kwargs.pop('out_indices', 4)
-    model = build_model_with_cfg(
-        Twins, variant, pretrained,
-        feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
-        **kwargs,
-    )
+    if kwargs.get('features_only', None):
+        raise RuntimeError('features_only not implemented for Vision Transformer models.')
+
+    model = build_model_with_cfg(Twins, variant, pretrained, **kwargs)
     return model
 
 
@@ -534,7 +458,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def twins_pcpvt_small(pretrained=False, **kwargs) -> Twins:
+def twins_pcpvt_small(pretrained=False, **kwargs):
     model_args = dict(
         patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4],
         depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1])
@@ -542,7 +466,7 @@ def twins_pcpvt_small(pretrained=False, **kwargs) -> Twins:
 
 
 @register_model
-def twins_pcpvt_base(pretrained=False, **kwargs) -> Twins:
+def twins_pcpvt_base(pretrained=False, **kwargs):
     model_args = dict(
         patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4],
         depths=[3, 4, 18, 3], sr_ratios=[8, 4, 2, 1])
@@ -550,7 +474,7 @@ def twins_pcpvt_base(pretrained=False, **kwargs) -> Twins:
 
 
 @register_model
-def twins_pcpvt_large(pretrained=False, **kwargs) -> Twins:
+def twins_pcpvt_large(pretrained=False, **kwargs):
     model_args = dict(
         patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4],
         depths=[3, 8, 27, 3], sr_ratios=[8, 4, 2, 1])
@@ -558,7 +482,7 @@ def twins_pcpvt_large(pretrained=False, **kwargs) -> Twins:
 
 
 @register_model
-def twins_svt_small(pretrained=False, **kwargs) -> Twins:
+def twins_svt_small(pretrained=False, **kwargs):
     model_args = dict(
         patch_size=4, embed_dims=[64, 128, 256, 512], num_heads=[2, 4, 8, 16], mlp_ratios=[4, 4, 4, 4],
         depths=[2, 2, 10, 4], wss=[7, 7, 7, 7], sr_ratios=[8, 4, 2, 1])
@@ -566,7 +490,7 @@ def twins_svt_small(pretrained=False, **kwargs) -> Twins:
 
 
 @register_model
-def twins_svt_base(pretrained=False, **kwargs) -> Twins:
+def twins_svt_base(pretrained=False, **kwargs):
     model_args = dict(
         patch_size=4, embed_dims=[96, 192, 384, 768], num_heads=[3, 6, 12, 24], mlp_ratios=[4, 4, 4, 4],
         depths=[2, 2, 18, 2], wss=[7, 7, 7, 7], sr_ratios=[8, 4, 2, 1])
@@ -574,7 +498,7 @@ def twins_svt_base(pretrained=False, **kwargs) -> Twins:
 
 
 @register_model
-def twins_svt_large(pretrained=False, **kwargs) -> Twins:
+def twins_svt_large(pretrained=False, **kwargs):
     model_args = dict(
         patch_size=4, embed_dims=[128, 256, 512, 1024], num_heads=[4, 8, 16, 32], mlp_ratios=[4, 4, 4, 4],
         depths=[2, 2, 18, 2], wss=[7, 7, 7, 7], sr_ratios=[8, 4, 2, 1])

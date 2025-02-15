@@ -393,7 +393,6 @@ class NormFreeNet(nn.Module):
             self.final_conv = nn.Identity()
         self.final_act = act_layer(inplace=cfg.num_features > 0)
 
-        self.head_hidden_size = self.num_features
         self.head = ClassifierHead(
             self.num_features,
             num_classes,
@@ -430,11 +429,10 @@ class NormFreeNet(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
-        self.num_classes = num_classes
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.head.reset(num_classes, global_pool)
 
     def forward_features(self, x):
@@ -608,10 +606,6 @@ model_cfgs = dict(
     nf_ecaresnet26=_nfres_cfg(depths=(2, 2, 2, 2), attn_layer='eca', attn_kwargs=dict()),
     nf_ecaresnet50=_nfres_cfg(depths=(3, 4, 6, 3), attn_layer='eca', attn_kwargs=dict()),
     nf_ecaresnet101=_nfres_cfg(depths=(3, 4, 23, 3), attn_layer='eca', attn_kwargs=dict()),
-
-    test_nfnet=_nfnet_cfg(
-        depths=(1, 1, 1, 1), channels=(32, 64, 96, 128), feat_mult=1.5, group_size=8, bottle_ratio=0.25,
-        attn_kwargs=dict(rd_ratio=0.25, rd_divisor=8), act_layer='silu'),
 )
 
 
@@ -735,16 +729,11 @@ default_cfgs = generate_default_cfgs({
     'nf_ecaresnet26': _dcfg(url='', first_conv='stem.conv'),
     'nf_ecaresnet50': _dcfg(url='', first_conv='stem.conv'),
     'nf_ecaresnet101': _dcfg(url='', first_conv='stem.conv'),
-
-    'test_nfnet.r160_in1k': _dcfg(
-        hf_hub_id='timm/',
-        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
-        crop_pct=0.95, input_size=(3, 160, 160), pool_size=(5, 5)),
 })
 
 
 @register_model
-def dm_nfnet_f0(pretrained=False, **kwargs) -> NormFreeNet:
+def dm_nfnet_f0(pretrained=False, **kwargs):
     """ NFNet-F0 (DeepMind weight compatible)
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -753,7 +742,7 @@ def dm_nfnet_f0(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def dm_nfnet_f1(pretrained=False, **kwargs) -> NormFreeNet:
+def dm_nfnet_f1(pretrained=False, **kwargs):
     """ NFNet-F1 (DeepMind weight compatible)
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -762,7 +751,7 @@ def dm_nfnet_f1(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def dm_nfnet_f2(pretrained=False, **kwargs) -> NormFreeNet:
+def dm_nfnet_f2(pretrained=False, **kwargs):
     """ NFNet-F2 (DeepMind weight compatible)
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -771,7 +760,7 @@ def dm_nfnet_f2(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def dm_nfnet_f3(pretrained=False, **kwargs) -> NormFreeNet:
+def dm_nfnet_f3(pretrained=False, **kwargs):
     """ NFNet-F3 (DeepMind weight compatible)
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -780,7 +769,7 @@ def dm_nfnet_f3(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def dm_nfnet_f4(pretrained=False, **kwargs) -> NormFreeNet:
+def dm_nfnet_f4(pretrained=False, **kwargs):
     """ NFNet-F4 (DeepMind weight compatible)
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -789,7 +778,7 @@ def dm_nfnet_f4(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def dm_nfnet_f5(pretrained=False, **kwargs) -> NormFreeNet:
+def dm_nfnet_f5(pretrained=False, **kwargs):
     """ NFNet-F5 (DeepMind weight compatible)
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -798,7 +787,7 @@ def dm_nfnet_f5(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def dm_nfnet_f6(pretrained=False, **kwargs) -> NormFreeNet:
+def dm_nfnet_f6(pretrained=False, **kwargs):
     """ NFNet-F6 (DeepMind weight compatible)
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -807,7 +796,7 @@ def dm_nfnet_f6(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f0(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f0(pretrained=False, **kwargs):
     """ NFNet-F0
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -816,7 +805,7 @@ def nfnet_f0(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f1(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f1(pretrained=False, **kwargs):
     """ NFNet-F1
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -825,7 +814,7 @@ def nfnet_f1(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f2(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f2(pretrained=False, **kwargs):
     """ NFNet-F2
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -834,7 +823,7 @@ def nfnet_f2(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f3(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f3(pretrained=False, **kwargs):
     """ NFNet-F3
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -843,7 +832,7 @@ def nfnet_f3(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f4(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f4(pretrained=False, **kwargs):
     """ NFNet-F4
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -852,7 +841,7 @@ def nfnet_f4(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f5(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f5(pretrained=False, **kwargs):
     """ NFNet-F5
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -861,7 +850,7 @@ def nfnet_f5(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f6(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f6(pretrained=False, **kwargs):
     """ NFNet-F6
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -870,7 +859,7 @@ def nfnet_f6(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_f7(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_f7(pretrained=False, **kwargs):
     """ NFNet-F7
     `High-Performance Large-Scale Image Recognition Without Normalization`
         - https://arxiv.org/abs/2102.06171
@@ -879,7 +868,7 @@ def nfnet_f7(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nfnet_l0(pretrained=False, **kwargs) -> NormFreeNet:
+def nfnet_l0(pretrained=False, **kwargs):
     """ NFNet-L0b w/ SiLU
     My experimental 'light' model w/ F0 repeats, 1.5x final_conv mult, 64 group_size, .25 bottleneck & SE ratio
     """
@@ -887,7 +876,7 @@ def nfnet_l0(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def eca_nfnet_l0(pretrained=False, **kwargs) -> NormFreeNet:
+def eca_nfnet_l0(pretrained=False, **kwargs):
     """ ECA-NFNet-L0 w/ SiLU
     My experimental 'light' model w/ F0 repeats, 1.5x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
@@ -895,7 +884,7 @@ def eca_nfnet_l0(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def eca_nfnet_l1(pretrained=False, **kwargs) -> NormFreeNet:
+def eca_nfnet_l1(pretrained=False, **kwargs):
     """ ECA-NFNet-L1 w/ SiLU
     My experimental 'light' model w/ F1 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
@@ -903,7 +892,7 @@ def eca_nfnet_l1(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def eca_nfnet_l2(pretrained=False, **kwargs) -> NormFreeNet:
+def eca_nfnet_l2(pretrained=False, **kwargs):
     """ ECA-NFNet-L2 w/ SiLU
     My experimental 'light' model w/ F2 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
@@ -911,7 +900,7 @@ def eca_nfnet_l2(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def eca_nfnet_l3(pretrained=False, **kwargs) -> NormFreeNet:
+def eca_nfnet_l3(pretrained=False, **kwargs):
     """ ECA-NFNet-L3 w/ SiLU
     My experimental 'light' model w/ F3 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
@@ -919,7 +908,7 @@ def eca_nfnet_l3(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_regnet_b0(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_regnet_b0(pretrained=False, **kwargs):
     """ Normalization-Free RegNet-B0
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -928,7 +917,7 @@ def nf_regnet_b0(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_regnet_b1(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_regnet_b1(pretrained=False, **kwargs):
     """ Normalization-Free RegNet-B1
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -937,7 +926,7 @@ def nf_regnet_b1(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_regnet_b2(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_regnet_b2(pretrained=False, **kwargs):
     """ Normalization-Free RegNet-B2
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -946,7 +935,7 @@ def nf_regnet_b2(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_regnet_b3(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_regnet_b3(pretrained=False, **kwargs):
     """ Normalization-Free RegNet-B3
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -955,7 +944,7 @@ def nf_regnet_b3(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_regnet_b4(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_regnet_b4(pretrained=False, **kwargs):
     """ Normalization-Free RegNet-B4
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -964,7 +953,7 @@ def nf_regnet_b4(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_regnet_b5(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_regnet_b5(pretrained=False, **kwargs):
     """ Normalization-Free RegNet-B5
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -973,7 +962,7 @@ def nf_regnet_b5(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_resnet26(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_resnet26(pretrained=False, **kwargs):
     """ Normalization-Free ResNet-26
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -982,7 +971,7 @@ def nf_resnet26(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_resnet50(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_resnet50(pretrained=False, **kwargs):
     """ Normalization-Free ResNet-50
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -991,7 +980,7 @@ def nf_resnet50(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_resnet101(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_resnet101(pretrained=False, **kwargs):
     """ Normalization-Free ResNet-101
     `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
         - https://arxiv.org/abs/2101.08692
@@ -1000,47 +989,42 @@ def nf_resnet101(pretrained=False, **kwargs) -> NormFreeNet:
 
 
 @register_model
-def nf_seresnet26(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_seresnet26(pretrained=False, **kwargs):
     """ Normalization-Free SE-ResNet26
     """
     return _create_normfreenet('nf_seresnet26', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_seresnet50(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_seresnet50(pretrained=False, **kwargs):
     """ Normalization-Free SE-ResNet50
     """
     return _create_normfreenet('nf_seresnet50', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_seresnet101(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_seresnet101(pretrained=False, **kwargs):
     """ Normalization-Free SE-ResNet101
     """
     return _create_normfreenet('nf_seresnet101', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_ecaresnet26(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_ecaresnet26(pretrained=False, **kwargs):
     """ Normalization-Free ECA-ResNet26
     """
     return _create_normfreenet('nf_ecaresnet26', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_ecaresnet50(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_ecaresnet50(pretrained=False, **kwargs):
     """ Normalization-Free ECA-ResNet50
     """
     return _create_normfreenet('nf_ecaresnet50', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_ecaresnet101(pretrained=False, **kwargs) -> NormFreeNet:
+def nf_ecaresnet101(pretrained=False, **kwargs):
     """ Normalization-Free ECA-ResNet101
     """
     return _create_normfreenet('nf_ecaresnet101', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def test_nfnet(pretrained=False, **kwargs) -> NormFreeNet:
-    return _create_normfreenet('test_nfnet', pretrained=pretrained, **kwargs)

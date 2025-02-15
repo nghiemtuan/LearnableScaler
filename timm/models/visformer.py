@@ -80,7 +80,7 @@ class Attention(nn.Module):
         head_dim = round(dim // num_heads * head_dim_ratio)
         self.head_dim = head_dim
         self.scale = head_dim ** -0.5
-        self.fused_attn = use_fused_attn(experimental=True)
+        self.fused_attn = use_fused_attn()
 
         self.qkv = nn.Conv2d(dim, head_dim * num_heads * 3, 1, stride=1, padding=0, bias=False)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -94,8 +94,8 @@ class Attention(nn.Module):
 
         if self.fused_attn:
             x = torch.nn.functional.scaled_dot_product_attention(
-                q.contiguous(), k.contiguous(), v.contiguous(),
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                q, k, v,
+                dropout_p=self.attn_drop.p,
             )
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -338,7 +338,7 @@ class Visformer(nn.Module):
             for i in range(self.stage_num1+self.stage_num2, depth)
         ])
 
-        self.num_features = self.head_hidden_size = embed_dim if self.vit_stem else embed_dim * 2
+        self.num_features = embed_dim if self.vit_stem else embed_dim * 2
         self.norm = norm_layer(self.num_features)
 
         # head
@@ -384,10 +384,10 @@ class Visformer(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.head = create_classifier(self.num_features, self.num_classes, pool_type=global_pool)
 
@@ -463,7 +463,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def visformer_tiny(pretrained=False, **kwargs) -> Visformer:
+def visformer_tiny(pretrained=False, **kwargs):
     model_cfg = dict(
         init_channels=16, embed_dim=192, depth=(7, 4, 4), num_heads=3, mlp_ratio=4., group=8,
         attn_stage='011', spatial_conv='100', norm_layer=nn.BatchNorm2d, conv_init=True,
@@ -473,7 +473,7 @@ def visformer_tiny(pretrained=False, **kwargs) -> Visformer:
 
 
 @register_model
-def visformer_small(pretrained=False, **kwargs) -> Visformer:
+def visformer_small(pretrained=False, **kwargs):
     model_cfg = dict(
         init_channels=32, embed_dim=384, depth=(7, 4, 4), num_heads=6, mlp_ratio=4., group=8,
         attn_stage='011', spatial_conv='100', norm_layer=nn.BatchNorm2d, conv_init=True,

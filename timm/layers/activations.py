@@ -47,7 +47,7 @@ def sigmoid(x, inplace: bool = False):
     return x.sigmoid_() if inplace else x.sigmoid()
 
 
-# PyTorch has this, but not with a consistent inplace argument interface
+# PyTorch has this, but not with a consistent inplace argmument interface
 class Sigmoid(nn.Module):
     def __init__(self, inplace: bool = False):
         super(Sigmoid, self).__init__()
@@ -61,7 +61,7 @@ def tanh(x, inplace: bool = False):
     return x.tanh_() if inplace else x.tanh()
 
 
-# PyTorch has this, but not with a consistent inplace argument interface
+# PyTorch has this, but not with a consistent inplace argmument interface
 class Tanh(nn.Module):
     def __init__(self, inplace: bool = False):
         super(Tanh, self).__init__()
@@ -157,17 +157,3 @@ class GELUTanh(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.gelu(input, approximate='tanh')
-
-
-def quick_gelu(x: torch.Tensor, inplace: bool = False) -> torch.Tensor:
-    return x * torch.sigmoid(1.702 * x)
-
-
-class QuickGELU(nn.Module):
-    """Applies the Gaussian Error Linear Units function (w/ dummy inplace arg)
-    """
-    def __init__(self, inplace: bool = False):
-        super(QuickGELU, self).__init__()
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return quick_gelu(input)

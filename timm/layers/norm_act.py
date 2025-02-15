@@ -19,18 +19,21 @@ from torch import nn as nn
 from torch.nn import functional as F
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from .create_act import create_act_layer
+from .create_act import get_act_layer
 from .fast_norm import is_fast_norm, fast_group_norm, fast_layer_norm
 from .trace_utils import _assert
 
 
 def _create_act(act_layer, act_kwargs=None, inplace=False, apply_act=True):
+    act_layer = get_act_layer(act_layer)  # string -> nn.Module
     act_kwargs = act_kwargs or {}
-    act_kwargs.setdefault('inplace', inplace)
-    act = None
-    if apply_act:
-        act = create_act_layer(act_layer, **act_kwargs)
-    return nn.Identity() if act is None else act
+    if act_layer is not None and apply_act:
+        if inplace:
+            act_kwargs['inplace'] = inplace
+        act = act_layer(**act_kwargs)
+    else:
+        act = nn.Identity()
+    return act
 
 
 class BatchNormAct2d(nn.BatchNorm2d):
@@ -176,7 +179,6 @@ def convert_sync_batchnorm(module, process_group=None):
         module_output.running_mean = module.running_mean
         module_output.running_var = module.running_var
         module_output.num_batches_tracked = module.num_batches_tracked
-        module_output.training = module.training
         if hasattr(module, "qconfig"):
             module_output.qconfig = module.qconfig
     for name, child in module.named_children():
@@ -419,6 +421,7 @@ class LayerNormAct(nn.LayerNorm):
     ):
         super(LayerNormAct, self).__init__(normalization_shape, eps=eps, elementwise_affine=affine)
         self.drop = drop_layer() if drop_layer is not None else nn.Identity()
+        act_layer = get_act_layer(act_layer)  # string -> nn.Module
         self.act = _create_act(act_layer, act_kwargs=act_kwargs, inplace=inplace, apply_act=apply_act)
 
         self._fast_norm = is_fast_norm()

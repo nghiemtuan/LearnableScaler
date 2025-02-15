@@ -5,7 +5,7 @@ timm functionality.
 
 Copyright 2021 Ross Wightman
 """
-from typing import Any, Dict, List, Optional, Type, Union, cast
+from typing import Union, List, Dict, Any, cast
 
 import torch
 import torch.nn as nn
@@ -38,8 +38,8 @@ class ConvMlp(nn.Module):
             kernel_size=7,
             mlp_ratio=1.0,
             drop_rate: float = 0.2,
-            act_layer: Type[nn.Module] = nn.ReLU,
-            conv_layer: Type[nn.Module] = nn.Conv2d,
+            act_layer: nn.Module = None,
+            conv_layer: nn.Module = None,
     ):
         super(ConvMlp, self).__init__()
         self.input_kernel_size = kernel_size
@@ -72,20 +72,20 @@ class VGG(nn.Module):
             in_chans: int = 3,
             output_stride: int = 32,
             mlp_ratio: float = 1.0,
-            act_layer: Type[nn.Module] = nn.ReLU,
-            conv_layer: Type[nn.Module] = nn.Conv2d,
-            norm_layer: Optional[Type[nn.Module]] = None,
+            act_layer: nn.Module = nn.ReLU,
+            conv_layer: nn.Module = nn.Conv2d,
+            norm_layer: nn.Module = None,
             global_pool: str = 'avg',
             drop_rate: float = 0.,
     ) -> None:
         super(VGG, self).__init__()
         assert output_stride == 32
         self.num_classes = num_classes
+        self.num_features = 4096
         self.drop_rate = drop_rate
         self.grad_checkpointing = False
         self.use_norm = norm_layer is not None
         self.feature_info = []
-
         prev_chs = in_chans
         net_stride = 1
         pool_layer = nn.MaxPool2d
@@ -107,11 +107,9 @@ class VGG(nn.Module):
         self.features = nn.Sequential(*layers)
         self.feature_info.append(dict(num_chs=prev_chs, reduction=net_stride, module=f'features.{len(layers) - 1}'))
 
-        self.num_features = prev_chs
-        self.head_hidden_size = 4096
         self.pre_logits = ConvMlp(
             prev_chs,
-            self.head_hidden_size,
+            self.num_features,
             7,
             mlp_ratio=mlp_ratio,
             drop_rate=drop_rate,
@@ -119,7 +117,7 @@ class VGG(nn.Module):
             conv_layer=conv_layer,
         )
         self.head = ClassifierHead(
-            self.head_hidden_size,
+            self.num_features,
             num_classes,
             pool_type=global_pool,
             drop_rate=drop_rate,
@@ -137,12 +135,17 @@ class VGG(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool)
+        self.head = ClassifierHead(
+            self.num_features,
+            self.num_classes,
+            pool_type=global_pool,
+            drop_rate=self.drop_rate,
+        )
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
@@ -150,7 +153,7 @@ class VGG(nn.Module):
 
     def forward_head(self, x: torch.Tensor, pre_logits: bool = False):
         x = self.pre_logits(x)
-        return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
+        return x if pre_logits else self.head(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.forward_features(x)

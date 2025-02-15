@@ -59,14 +59,14 @@ class Attention(nn.Module):
     def forward(self, x):
         """
         x is shape: B (batch_size), T (image blocks), N (seq length per image block), C (embed dim)
-        """
+        """ 
         B, T, N, C = x.shape
         # result of next line is (qkv, B, num (H)eads, T, N, (C')hannels per head)
         qkv = self.qkv(x).reshape(B, T, N, 3, self.num_heads, C // self.num_heads).permute(3, 0, 4, 1, 2, 5)
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p)
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1) # (B, H, T, N, N)
@@ -309,7 +309,7 @@ class Nest(nn.Module):
         num_heads = to_ntuple(num_levels)(num_heads)
         depths = to_ntuple(num_levels)(depths)
         self.num_classes = num_classes
-        self.num_features = self.head_hidden_size = embed_dims[-1]
+        self.num_features = embed_dims[-1]
         self.feature_info = []
         norm_layer = norm_layer or LayerNorm
         act_layer = act_layer or nn.GELU
@@ -330,7 +330,7 @@ class Nest(nn.Module):
         # Hint: (img_size // patch_size) gives number of patches along edge of image. sqrt(self.num_blocks[0]) is the
         #  number of blocks along edge of image
         self.block_size = int((img_size // patch_size) // math.sqrt(self.num_blocks[0]))
-
+        
         # Patch embedding
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -412,10 +412,10 @@ class Nest(nn.Module):
             l.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.head = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
@@ -518,7 +518,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def nest_base(pretrained=False, **kwargs) -> Nest:
+def nest_base(pretrained=False, **kwargs):
     """ Nest-B @ 224x224
     """
     model_kwargs = dict(
@@ -528,7 +528,7 @@ def nest_base(pretrained=False, **kwargs) -> Nest:
 
 
 @register_model
-def nest_small(pretrained=False, **kwargs) -> Nest:
+def nest_small(pretrained=False, **kwargs):
     """ Nest-S @ 224x224
     """
     model_kwargs = dict(embed_dims=(96, 192, 384), num_heads=(3, 6, 12), depths=(2, 2, 20), **kwargs)
@@ -537,7 +537,7 @@ def nest_small(pretrained=False, **kwargs) -> Nest:
 
 
 @register_model
-def nest_tiny(pretrained=False, **kwargs) -> Nest:
+def nest_tiny(pretrained=False, **kwargs):
     """ Nest-T @ 224x224
     """
     model_kwargs = dict(embed_dims=(96, 192, 384), num_heads=(3, 6, 12), depths=(2, 2, 8), **kwargs)
@@ -546,7 +546,7 @@ def nest_tiny(pretrained=False, **kwargs) -> Nest:
 
 
 @register_model
-def nest_base_jx(pretrained=False, **kwargs) -> Nest:
+def nest_base_jx(pretrained=False, **kwargs):
     """ Nest-B @ 224x224
     """
     kwargs.setdefault('pad_type', 'same')
@@ -557,7 +557,7 @@ def nest_base_jx(pretrained=False, **kwargs) -> Nest:
 
 
 @register_model
-def nest_small_jx(pretrained=False, **kwargs) -> Nest:
+def nest_small_jx(pretrained=False, **kwargs):
     """ Nest-S @ 224x224
     """
     kwargs.setdefault('pad_type', 'same')
@@ -567,7 +567,7 @@ def nest_small_jx(pretrained=False, **kwargs) -> Nest:
 
 
 @register_model
-def nest_tiny_jx(pretrained=False, **kwargs) -> Nest:
+def nest_tiny_jx(pretrained=False, **kwargs):
     """ Nest-T @ 224x224
     """
     kwargs.setdefault('pad_type', 'same')

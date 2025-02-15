@@ -7,24 +7,17 @@ Hacked together by / Copyright 2022, Ross Wightman
 import logging
 import math
 from functools import partial
-from typing import List, Optional, Tuple, Type, Union
-
-try:
-    from typing import Literal
-except ImportError:
-    from typing_extensions import Literal
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.jit import Final
+from torch.utils.checkpoint import checkpoint
 
 from timm.data import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
-from timm.layers import PatchEmbed, Mlp, DropPath, RelPosMlp, RelPosBias, use_fused_attn, LayerType
+from timm.layers import PatchEmbed, Mlp, DropPath, RelPosMlp, RelPosBias, use_fused_attn
 from ._builder import build_model_with_cfg
-from ._features import feature_take_indices
-from ._manipulate import named_apply, checkpoint
 from ._registry import generate_default_cfgs, register_model
-from .vision_transformer import get_init_weights_vit
 
 __all__ = ['VisionTransformerRelPos']  # model_registry will add each entrypoint fn to this
 
@@ -78,7 +71,7 @@ class RelPosAttention(nn.Module):
             x = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_bias,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                dropout_p=self.attn_drop.p,
             )
         else:
             q = q * self.scale
@@ -222,61 +215,59 @@ class VisionTransformerRelPos(nn.Module):
 
     def __init__(
             self,
-            img_size: Union[int, Tuple[int, int]] = 224,
-            patch_size: Union[int, Tuple[int, int]] = 16,
-            in_chans: int = 3,
-            num_classes: int = 1000,
-            global_pool: Literal['', 'avg', 'token', 'map'] = 'avg',
-            embed_dim: int = 768,
-            depth: int = 12,
-            num_heads: int = 12,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = True,
-            qk_norm: bool = False,
-            init_values: Optional[float] = 1e-6,
-            class_token: bool = False,
-            fc_norm: bool = False,
-            rel_pos_type: str = 'mlp',
-            rel_pos_dim: Optional[int] = None,
-            shared_rel_pos: bool = False,
-            drop_rate: float = 0.,
-            proj_drop_rate: float = 0.,
-            attn_drop_rate: float = 0.,
-            drop_path_rate: float = 0.,
-            weight_init: Literal['skip', 'jax', 'moco', ''] = 'skip',
-            fix_init: bool = False,
-            embed_layer: Type[nn.Module] = PatchEmbed,
-            norm_layer: Optional[LayerType] = None,
-            act_layer: Optional[LayerType] = None,
-            block_fn: Type[nn.Module] = RelPosBlock
+            img_size=224,
+            patch_size=16,
+            in_chans=3,
+            num_classes=1000,
+            global_pool='avg',
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            mlp_ratio=4.,
+            qkv_bias=True,
+            qk_norm=False,
+            init_values=1e-6,
+            class_token=False,
+            fc_norm=False,
+            rel_pos_type='mlp',
+            rel_pos_dim=None,
+            shared_rel_pos=False,
+            drop_rate=0.,
+            proj_drop_rate=0.,
+            attn_drop_rate=0.,
+            drop_path_rate=0.,
+            weight_init='skip',
+            embed_layer=PatchEmbed,
+            norm_layer=None,
+            act_layer=None,
+            block_fn=RelPosBlock
     ):
         """
         Args:
-            img_size: input image size
-            patch_size: patch size
-            in_chans: number of input channels
-            num_classes: number of classes for classification head
-            global_pool: type of global pooling for final sequence (default: 'avg')
-            embed_dim: embedding dimension
-            depth: depth of transformer
-            num_heads: number of attention heads
-            mlp_ratio: ratio of mlp hidden dim to embedding dim
-            qkv_bias: enable bias for qkv if True
-            qk_norm: Enable normalization of query and key in attention
-            init_values: layer-scale init values
-            class_token: use class token (default: False)
-            fc_norm: use pre classifier norm instead of pre-pool
-            rel_pos_type: type of relative position
-            shared_rel_pos: share relative pos across all blocks
-            drop_rate: dropout rate
-            proj_drop_rate: projection dropout rate
-            attn_drop_rate: attention dropout rate
-            drop_path_rate: stochastic depth rate
-            weight_init: weight init scheme
-            fix_init: apply weight initialization fix (scaling w/ layer index)
-            embed_layer: patch embedding layer
-            norm_layer: normalization layer
-            act_layer: MLP activation layer
+            img_size (int, tuple): input image size
+            patch_size (int, tuple): patch size
+            in_chans (int): number of input channels
+            num_classes (int): number of classes for classification head
+            global_pool (str): type of global pooling for final sequence (default: 'avg')
+            embed_dim (int): embedding dimension
+            depth (int): depth of transformer
+            num_heads (int): number of attention heads
+            mlp_ratio (int): ratio of mlp hidden dim to embedding dim
+            qkv_bias (bool): enable bias for qkv if True
+            qk_norm (bool): Enable normalization of query and key in attention
+            init_values: (float): layer-scale init values
+            class_token (bool): use class token (default: False)
+            fc_norm (bool): use pre classifier norm instead of pre-pool
+            rel_pos_ty pe (str): type of relative position
+            shared_rel_pos (bool): share relative pos across all blocks
+            drop_rate (float): dropout rate
+            proj_drop_rate (float): projection dropout rate
+            attn_drop_rate (float): attention dropout rate
+            drop_path_rate (float): stochastic depth rate
+            weight_init (str): weight init scheme
+            embed_layer (nn.Module): patch embedding layer
+            norm_layer: (nn.Module): normalization layer
+            act_layer: (nn.Module): MLP activation layer
         """
         super().__init__()
         assert global_pool in ('', 'avg', 'token')
@@ -286,7 +277,7 @@ class VisionTransformerRelPos(nn.Module):
 
         self.num_classes = num_classes
         self.global_pool = global_pool
-        self.num_features = self.head_hidden_size = self.embed_dim = embed_dim  # for consistency with other models
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.num_prefix_tokens = 1 if class_token else 0
         self.grad_checkpointing = False
 
@@ -297,7 +288,6 @@ class VisionTransformerRelPos(nn.Module):
             embed_dim=embed_dim,
         )
         feat_size = self.patch_embed.grid_size
-        r = self.patch_embed.feat_ratio() if hasattr(self.patch_embed, 'feat_ratio') else patch_size
 
         rel_pos_args = dict(window_size=feat_size, prefix_tokens=self.num_prefix_tokens)
         if rel_pos_type.startswith('mlp'):
@@ -333,8 +323,6 @@ class VisionTransformerRelPos(nn.Module):
                 act_layer=act_layer,
             )
             for i in range(depth)])
-        self.feature_info = [
-            dict(module=f'blocks.{i}', num_chs=embed_dim, reduction=r) for i in range(depth)]
         self.norm = norm_layer(embed_dim) if not fc_norm else nn.Identity()
 
         # Classifier Head
@@ -344,22 +332,13 @@ class VisionTransformerRelPos(nn.Module):
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
-        if fix_init:
-            self.fix_init_weight()
 
     def init_weights(self, mode=''):
         assert mode in ('jax', 'moco', '')
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, std=1e-6)
-        named_apply(get_init_weights_vit(mode), self)
-
-    def fix_init_weight(self):
-        def rescale(param, _layer_id):
-            param.div_(math.sqrt(2.0 * _layer_id))
-
-        for layer_id, layer in enumerate(self.blocks):
-            rescale(layer.attn.proj.weight.data, layer_id + 1)
-            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+        # FIXME weight init scheme using PyTorch defaults curently
+        #named_apply(get_init_weights_vit(mode, head_bias), self)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -377,97 +356,15 @@ class VisionTransformerRelPos(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes: int, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('', 'avg', 'token')
             self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            indices: Optional[Union[int, List[int]]] = None,
-            return_prefix_tokens: bool = False,
-            norm: bool = False,
-            stop_early: bool = False,
-            output_fmt: str = 'NCHW',
-            intermediates_only: bool = False,
-    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
-
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            return_prefix_tokens: Return both prefix and spatial intermediate tokens
-            norm: Apply norm layer to all intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-        Returns:
-
-        """
-        assert output_fmt in ('NCHW', 'NLC'), 'Output format must be one of NCHW or NLC.'
-        reshape = output_fmt == 'NCHW'
-        intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
-
-        # forward pass
-        B, _, height, width = x.shape
-        x = self.patch_embed(x)
-        if self.cls_token is not None:
-            x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-
-        shared_rel_pos = self.shared_rel_pos.get_bias() if self.shared_rel_pos is not None else None
-        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
-            blocks = self.blocks
-        else:
-            blocks = self.blocks[:max_index + 1]
-        for i, blk in enumerate(blocks):
-            x = blk(x, shared_rel_pos=shared_rel_pos)
-            if i in take_indices:
-                # normalize intermediates with final norm layer if enabled
-                intermediates.append(self.norm(x) if norm else x)
-
-        # process intermediates
-        if self.num_prefix_tokens:
-            # split prefix (e.g. class, distill) and spatial feature tokens
-            prefix_tokens = [y[:, 0:self.num_prefix_tokens] for y in intermediates]
-            intermediates = [y[:, self.num_prefix_tokens:] for y in intermediates]
-        if reshape:
-            # reshape to BCHW output format
-            H, W = self.patch_embed.dynamic_feat_size((height, width))
-            intermediates = [y.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous() for y in intermediates]
-        if not torch.jit.is_scripting() and return_prefix_tokens:
-            # return_prefix not support in torchscript due to poor type handling
-            intermediates = list(zip(intermediates, prefix_tokens))
-
-        if intermediates_only:
-            return intermediates
-
-        x = self.norm(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
-        self.blocks = self.blocks[:max_index + 1]  # truncate blocks
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
-            self.fc_norm = nn.Identity()
-            self.reset_classifier(0, '')
-        return take_indices
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -497,12 +394,10 @@ class VisionTransformerRelPos(nn.Module):
 
 
 def _create_vision_transformer_relpos(variant, pretrained=False, **kwargs):
-    out_indices = kwargs.pop('out_indices', 3)
-    model = build_model_with_cfg(
-        VisionTransformerRelPos, variant, pretrained,
-        feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
-        **kwargs,
-    )
+    if kwargs.get('features_only', None):
+        raise RuntimeError('features_only not implemented for Vision Transformer models.')
+
+    model = build_model_with_cfg(VisionTransformerRelPos, variant, pretrained, **kwargs)
     return model
 
 
@@ -558,7 +453,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def vit_relpos_base_patch32_plus_rpn_256(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_base_patch32_plus_rpn_256(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/32+) w/ relative log-coord position and residual post-norm, no class token
     """
     model_args = dict(patch_size=32, embed_dim=896, depth=12, num_heads=14, block_fn=ResPostRelPosBlock)
@@ -568,7 +463,7 @@ def vit_relpos_base_patch32_plus_rpn_256(pretrained=False, **kwargs) -> VisionTr
 
 
 @register_model
-def vit_relpos_base_patch16_plus_240(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_base_patch16_plus_240(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16+) w/ relative log-coord position, no class token
     """
     model_args = dict(patch_size=16, embed_dim=896, depth=12, num_heads=14)
@@ -578,7 +473,7 @@ def vit_relpos_base_patch16_plus_240(pretrained=False, **kwargs) -> VisionTransf
 
 
 @register_model
-def vit_relpos_small_patch16_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_small_patch16_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position, no class token
     """
     model_args = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, qkv_bias=False, fc_norm=True)
@@ -588,7 +483,7 @@ def vit_relpos_small_patch16_224(pretrained=False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_relpos_medium_patch16_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_medium_patch16_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position, no class token
     """
     model_args = dict(
@@ -599,7 +494,7 @@ def vit_relpos_medium_patch16_224(pretrained=False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_relpos_base_patch16_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_base_patch16_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position, no class token
     """
     model_args = dict(
@@ -610,7 +505,7 @@ def vit_relpos_base_patch16_224(pretrained=False, **kwargs) -> VisionTransformer
 
 
 @register_model
-def vit_srelpos_small_patch16_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_srelpos_small_patch16_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ shared relative log-coord position, no class token
     """
     model_args = dict(
@@ -622,7 +517,7 @@ def vit_srelpos_small_patch16_224(pretrained=False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_srelpos_medium_patch16_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_srelpos_medium_patch16_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ shared relative log-coord position, no class token
     """
     model_args = dict(
@@ -634,7 +529,7 @@ def vit_srelpos_medium_patch16_224(pretrained=False, **kwargs) -> VisionTransfor
 
 
 @register_model
-def vit_relpos_medium_patch16_cls_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_medium_patch16_cls_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-M/16) w/ relative log-coord position, class token present
     """
     model_args = dict(
@@ -646,7 +541,7 @@ def vit_relpos_medium_patch16_cls_224(pretrained=False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_relpos_base_patch16_cls_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_base_patch16_cls_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position, class token present
     """
     model_args = dict(
@@ -657,7 +552,7 @@ def vit_relpos_base_patch16_cls_224(pretrained=False, **kwargs) -> VisionTransfo
 
 
 @register_model
-def vit_relpos_base_patch16_clsgap_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_base_patch16_clsgap_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position, class token present
     NOTE this config is a bit of a mistake, class token was enabled but global avg-pool w/ fc-norm was not disabled
     Leaving here for comparisons w/ a future re-train as it performs quite well.
@@ -670,7 +565,7 @@ def vit_relpos_base_patch16_clsgap_224(pretrained=False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_relpos_small_patch16_rpn_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_small_patch16_rpn_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position and residual post-norm, no class token
     """
     model_args = dict(
@@ -681,7 +576,7 @@ def vit_relpos_small_patch16_rpn_224(pretrained=False, **kwargs) -> VisionTransf
 
 
 @register_model
-def vit_relpos_medium_patch16_rpn_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_medium_patch16_rpn_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position and residual post-norm, no class token
     """
     model_args = dict(
@@ -692,7 +587,7 @@ def vit_relpos_medium_patch16_rpn_224(pretrained=False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_relpos_base_patch16_rpn_224(pretrained=False, **kwargs) -> VisionTransformerRelPos:
+def vit_relpos_base_patch16_rpn_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ relative log-coord position and residual post-norm, no class token
     """
     model_args = dict(

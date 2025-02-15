@@ -21,11 +21,12 @@ Modifications and additions for timm hacked together by / Copyright 2021, Ross W
 
 
 """
-Modified from Timm. https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+Modifed from Timm. https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
 
 """
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import List
+from typing import Tuple
 
 import torch
 import torch.hub
@@ -38,7 +39,7 @@ from ._features_fx import register_notrace_function
 from ._registry import register_model, generate_default_cfgs
 from .vision_transformer import Block
 
-__all__ = ['CrossVit']  # model_registry will add each entrypoint fn to this
+__all__ = ['CrossViT']  # model_registry will add each entrypoint fn to this
 
 
 class PatchEmbed(nn.Module):
@@ -292,7 +293,7 @@ def scale_image(x, ss: Tuple[int, int], crop_scale: bool = False):  # annotation
     return x
 
 
-class CrossVit(nn.Module):
+class CrossViT(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
 
@@ -330,7 +331,7 @@ class CrossVit(nn.Module):
         num_patches = _compute_num_patches(self.img_size_scaled, patch_size)
         self.num_branches = len(patch_size)
         self.embed_dim = embed_dim
-        self.num_features = self.head_hidden_size = sum(embed_dim)
+        self.num_features = sum(embed_dim)
         self.patch_embed = nn.ModuleList()
 
         # hard-coded for torch jit script
@@ -415,18 +416,17 @@ class CrossVit(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('token', 'avg')
             self.global_pool = global_pool
-        self.head = nn.ModuleList([
-            nn.Linear(self.embed_dim[i], num_classes) if num_classes > 0 else nn.Identity()
-            for i in range(self.num_branches)
-        ])
+        self.head = nn.ModuleList(
+            [nn.Linear(self.embed_dim[i], num_classes) if num_classes > 0 else nn.Identity() for i in
+             range(self.num_branches)])
 
     def forward_features(self, x) -> List[torch.Tensor]:
         B = x.shape[0]
@@ -479,7 +479,7 @@ def _create_crossvit(variant, pretrained=False, **kwargs):
         return new_state_dict
 
     return build_model_with_cfg(
-        CrossVit,
+        CrossViT,
         variant,
         pretrained,
         pretrained_filter_fn=pretrained_filter_fn,
@@ -529,7 +529,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def crossvit_tiny_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_tiny_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224/240), patch_size=[12, 16], embed_dim=[96, 192], depth=[[1, 4, 0], [1, 4, 0], [1, 4, 0]],
         num_heads=[3, 3], mlp_ratio=[4, 4, 1])
@@ -538,7 +538,7 @@ def crossvit_tiny_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_small_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_small_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224/240), patch_size=[12, 16], embed_dim=[192, 384], depth=[[1, 4, 0], [1, 4, 0], [1, 4, 0]],
         num_heads=[6, 6], mlp_ratio=[4, 4, 1])
@@ -547,7 +547,7 @@ def crossvit_small_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_base_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_base_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224/240), patch_size=[12, 16], embed_dim=[384, 768], depth=[[1, 4, 0], [1, 4, 0], [1, 4, 0]],
         num_heads=[12, 12], mlp_ratio=[4, 4, 1])
@@ -556,7 +556,7 @@ def crossvit_base_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_9_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_9_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224/240), patch_size=[12, 16], embed_dim=[128, 256], depth=[[1, 3, 0], [1, 3, 0], [1, 3, 0]],
         num_heads=[4, 4], mlp_ratio=[3, 3, 1])
@@ -565,7 +565,7 @@ def crossvit_9_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_15_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_15_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224/240), patch_size=[12, 16], embed_dim=[192, 384], depth=[[1, 5, 0], [1, 5, 0], [1, 5, 0]],
         num_heads=[6, 6], mlp_ratio=[3, 3, 1])
@@ -574,7 +574,7 @@ def crossvit_15_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_18_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_18_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224 / 240), patch_size=[12, 16], embed_dim=[224, 448], depth=[[1, 6, 0], [1, 6, 0], [1, 6, 0]],
         num_heads=[7, 7], mlp_ratio=[3, 3, 1], **kwargs)
@@ -583,7 +583,7 @@ def crossvit_18_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_9_dagger_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_9_dagger_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224 / 240), patch_size=[12, 16], embed_dim=[128, 256], depth=[[1, 3, 0], [1, 3, 0], [1, 3, 0]],
         num_heads=[4, 4], mlp_ratio=[3, 3, 1], multi_conv=True)
@@ -592,7 +592,7 @@ def crossvit_9_dagger_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_15_dagger_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_15_dagger_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224/240), patch_size=[12, 16], embed_dim=[192, 384], depth=[[1, 5, 0], [1, 5, 0], [1, 5, 0]],
         num_heads=[6, 6], mlp_ratio=[3, 3, 1], multi_conv=True)
@@ -601,7 +601,7 @@ def crossvit_15_dagger_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_15_dagger_408(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_15_dagger_408(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 384/408), patch_size=[12, 16], embed_dim=[192, 384], depth=[[1, 5, 0], [1, 5, 0], [1, 5, 0]],
         num_heads=[6, 6], mlp_ratio=[3, 3, 1], multi_conv=True)
@@ -610,7 +610,7 @@ def crossvit_15_dagger_408(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_18_dagger_240(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_18_dagger_240(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 224/240), patch_size=[12, 16], embed_dim=[224, 448], depth=[[1, 6, 0], [1, 6, 0], [1, 6, 0]],
         num_heads=[7, 7], mlp_ratio=[3, 3, 1], multi_conv=True)
@@ -619,7 +619,7 @@ def crossvit_18_dagger_240(pretrained=False, **kwargs) -> CrossVit:
 
 
 @register_model
-def crossvit_18_dagger_408(pretrained=False, **kwargs) -> CrossVit:
+def crossvit_18_dagger_408(pretrained=False, **kwargs):
     model_args = dict(
         img_scale=(1.0, 384/408), patch_size=[12, 16], embed_dim=[224, 448], depth=[[1, 6, 0], [1, 6, 0], [1, 6, 0]],
         num_heads=[7, 7], mlp_ratio=[3, 3, 1], multi_conv=True)

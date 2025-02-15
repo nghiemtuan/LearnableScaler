@@ -239,7 +239,7 @@ class PNASNet5Large(nn.Module):
     ):
         super(PNASNet5Large, self).__init__()
         self.num_classes = num_classes
-        self.num_features = self.head_hidden_size = 4320
+        self.num_features = 4320
         assert output_stride == 32
 
         self.conv_0 = ConvNormAct(
@@ -304,10 +304,10 @@ class PNASNet5Large(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.last_linear
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.last_linear = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
@@ -355,6 +355,7 @@ def _create_pnasnet(variant, pretrained=False, **kwargs):
 default_cfgs = generate_default_cfgs({
     'pnasnet5large.tf_in1k': {
         'hf_hub_id': 'timm/',
+        'url': 'https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-cadene/pnasnet5large-bf079911.pth',
         'input_size': (3, 331, 331),
         'pool_size': (11, 11),
         'crop_pct': 0.911,
@@ -364,12 +365,13 @@ default_cfgs = generate_default_cfgs({
         'num_classes': 1000,
         'first_conv': 'conv_0.conv',
         'classifier': 'last_linear',
+        'label_offset': 1,  # 1001 classes in pretrained weights
     },
 })
 
 
 @register_model
-def pnasnet5large(pretrained=False, **kwargs) -> PNASNet5Large:
+def pnasnet5large(pretrained=False, **kwargs):
     r"""PNASNet-5 model architecture from the
     `"Progressive Neural Architecture Search"
     <https://arxiv.org/abs/1712.00559>`_ paper.

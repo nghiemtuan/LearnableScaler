@@ -231,7 +231,7 @@ class InceptionV4(nn.Module):
         super(InceptionV4, self).__init__()
         assert output_stride == 32
         self.num_classes = num_classes
-        self.num_features = self.head_hidden_size = 1536
+        self.num_features = 1536
         conv_block = partial(
             ConvNormAct,
             padding=0,
@@ -277,10 +277,10 @@ class InceptionV4(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.last_linear
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.last_linear = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
@@ -299,7 +299,7 @@ class InceptionV4(nn.Module):
         return x
 
 
-def _create_inception_v4(variant, pretrained=False, **kwargs) -> InceptionV4:
+def _create_inception_v4(variant, pretrained=False, **kwargs):
     return build_model_with_cfg(
         InceptionV4,
         variant,
@@ -312,10 +312,12 @@ def _create_inception_v4(variant, pretrained=False, **kwargs) -> InceptionV4:
 default_cfgs = generate_default_cfgs({
     'inception_v4.tf_in1k': {
         'hf_hub_id': 'timm/',
+        'url': 'https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-cadene/inceptionv4-8e4777a0.pth',
         'num_classes': 1000, 'input_size': (3, 299, 299), 'pool_size': (8, 8),
         'crop_pct': 0.875, 'interpolation': 'bicubic',
         'mean': IMAGENET_INCEPTION_MEAN, 'std': IMAGENET_INCEPTION_STD,
         'first_conv': 'features.0.conv', 'classifier': 'last_linear',
+        'label_offset': 1,  # 1001 classes in pretrained weights
     }
 })
 
