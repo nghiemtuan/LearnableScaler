@@ -9,7 +9,7 @@ Paper: `Sequencer: Deep LSTM for Image Classification` - https://arxiv.org/pdf/2
 import math
 from functools import partial
 from itertools import accumulate
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -338,7 +338,7 @@ class Sequencer2d(nn.Module):
         assert global_pool in ('', 'avg')
         self.num_classes = num_classes
         self.global_pool = global_pool
-        self.num_features = self.head_hidden_size = embed_dims[-1]  # for consistency with other models
+        self.num_features = embed_dims[-1]  # num_features for consistency with other models
         self.feature_dim = -1  # channel dim index for feature outputs (rank 4, NHWC)
         self.output_fmt = 'NHWC'
         self.feature_info = []
@@ -416,10 +416,10 @@ class Sequencer2d(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         self.head.reset(num_classes, pool_type=global_pool)
 
@@ -490,7 +490,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def sequencer2d_s(pretrained=False, **kwargs) -> Sequencer2d:
+def sequencer2d_s(pretrained=False, **kwargs):
     model_args = dict(
         layers=[4, 3, 8, 3],
         patch_sizes=[7, 2, 1, 1],
@@ -507,7 +507,7 @@ def sequencer2d_s(pretrained=False, **kwargs) -> Sequencer2d:
 
 
 @register_model
-def sequencer2d_m(pretrained=False, **kwargs) -> Sequencer2d:
+def sequencer2d_m(pretrained=False, **kwargs):
     model_args = dict(
         layers=[4, 3, 14, 3],
         patch_sizes=[7, 2, 1, 1],
@@ -524,7 +524,7 @@ def sequencer2d_m(pretrained=False, **kwargs) -> Sequencer2d:
 
 
 @register_model
-def sequencer2d_l(pretrained=False, **kwargs) -> Sequencer2d:
+def sequencer2d_l(pretrained=False, **kwargs):
     model_args = dict(
         layers=[8, 8, 16, 4],
         patch_sizes=[7, 2, 1, 1],

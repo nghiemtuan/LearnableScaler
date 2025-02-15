@@ -299,7 +299,7 @@ class SENet(nn.Module):
             downsample_padding=downsample_padding
         )
         self.feature_info += [dict(num_chs=512 * block.expansion, reduction=32, module='layer4')]
-        self.num_features = self.head_hidden_size = 512 * block.expansion
+        self.num_features = 512 * block.expansion
         self.global_pool, self.last_linear = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
 
@@ -334,10 +334,10 @@ class SENet(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.last_linear
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.last_linear = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
@@ -402,42 +402,42 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def legacy_seresnet18(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnet18(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNetBlock, layers=[2, 2, 2, 2], groups=1, reduction=16, **kwargs)
     return _create_senet('legacy_seresnet18', pretrained, **model_args)
 
 
 @register_model
-def legacy_seresnet34(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnet34(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNetBlock, layers=[3, 4, 6, 3], groups=1, reduction=16, **kwargs)
     return _create_senet('legacy_seresnet34', pretrained, **model_args)
 
 
 @register_model
-def legacy_seresnet50(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnet50(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNetBottleneck, layers=[3, 4, 6, 3], groups=1, reduction=16, **kwargs)
     return _create_senet('legacy_seresnet50', pretrained, **model_args)
 
 
 @register_model
-def legacy_seresnet101(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnet101(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNetBottleneck, layers=[3, 4, 23, 3], groups=1, reduction=16, **kwargs)
     return _create_senet('legacy_seresnet101', pretrained, **model_args)
 
 
 @register_model
-def legacy_seresnet152(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnet152(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNetBottleneck, layers=[3, 8, 36, 3], groups=1, reduction=16, **kwargs)
     return _create_senet('legacy_seresnet152', pretrained, **model_args)
 
 
 @register_model
-def legacy_senet154(pretrained=False, **kwargs) -> SENet:
+def legacy_senet154(pretrained=False, **kwargs):
     model_args = dict(
         block=SEBottleneck, layers=[3, 8, 36, 3], groups=64, reduction=16,
         downsample_kernel_size=3, downsample_padding=1,  inplanes=128, input_3x3=True, **kwargs)
@@ -445,21 +445,21 @@ def legacy_senet154(pretrained=False, **kwargs) -> SENet:
 
 
 @register_model
-def legacy_seresnext26_32x4d(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnext26_32x4d(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNeXtBottleneck, layers=[2, 2, 2, 2], groups=32, reduction=16, **kwargs)
     return _create_senet('legacy_seresnext26_32x4d', pretrained, **model_args)
 
 
 @register_model
-def legacy_seresnext50_32x4d(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnext50_32x4d(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNeXtBottleneck, layers=[3, 4, 6, 3], groups=32, reduction=16, **kwargs)
     return _create_senet('legacy_seresnext50_32x4d', pretrained, **model_args)
 
 
 @register_model
-def legacy_seresnext101_32x4d(pretrained=False, **kwargs) -> SENet:
+def legacy_seresnext101_32x4d(pretrained=False, **kwargs):
     model_args = dict(
         block=SEResNeXtBottleneck, layers=[3, 4, 23, 3], groups=32, reduction=16, **kwargs)
     return _create_senet('legacy_seresnext101_32x4d', pretrained, **model_args)

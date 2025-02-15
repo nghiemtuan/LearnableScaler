@@ -12,8 +12,6 @@ from .helpers import to_2tuple
 
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
-
-    NOTE: When use_conv=True, expects 2D NCHW tensors, otherwise N*C expected.
     """
     def __init__(
             self,
@@ -44,7 +42,6 @@ class Mlp(nn.Module):
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop1(x)
-        x = self.norm(x)
         x = self.fc2(x)
         x = self.drop2(x)
         return x
@@ -53,8 +50,6 @@ class Mlp(nn.Module):
 class GluMlp(nn.Module):
     """ MLP w/ GLU style gating
     See: https://arxiv.org/abs/1612.08083, https://arxiv.org/abs/2002.05202
-
-    NOTE: When use_conv=True, expects 2D NCHW tensors, otherwise N*C expected.
     """
     def __init__(
             self,
@@ -87,9 +82,9 @@ class GluMlp(nn.Module):
 
     def init_weights(self):
         # override init of fc1 w/ gate portion set to weight near zero, bias=1
-        if self.fc1.bias is not None:
-            nn.init.ones_(self.fc1.bias[self.fc1.bias.shape[0] // 2:])
-        nn.init.normal_(self.fc1.weight[self.fc1.weight.shape[0] // 2:], std=1e-6)
+        fc1_mid = self.fc1.bias.shape[0] // 2
+        nn.init.ones_(self.fc1.bias[fc1_mid:])
+        nn.init.normal_(self.fc1.weight[fc1_mid:], std=1e-6)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -100,9 +95,6 @@ class GluMlp(nn.Module):
         x = self.fc2(x)
         x = self.drop2(x)
         return x
-
-
-SwiGLUPacked = partial(GluMlp, act_layer=nn.SiLU, gate_last=False)
 
 
 class SwiGLU(nn.Module):
@@ -116,7 +108,7 @@ class SwiGLU(nn.Module):
             hidden_features=None,
             out_features=None,
             act_layer=nn.SiLU,
-            norm_layer=None,
+            norm_layer=nn.LayerNorm,
             bias=True,
             drop=0.,
     ):
@@ -134,11 +126,12 @@ class SwiGLU(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1])
         self.drop2 = nn.Dropout(drop_probs[1])
 
+        self.drop = nn.Dropout(drop)
+
     def init_weights(self):
         # override init of fc1 w/ gate portion set to weight near zero, bias=1
-        if self.fc1_g.bias is not None:
-            nn.init.ones_(self.fc1_g.bias)
-        nn.init.normal_(self.fc1_g.weight, std=1e-6)
+        nn.init.ones_(self.fc1a.bias)
+        nn.init.normal_(self.fc1a.weight, std=1e-6)
 
     def forward(self, x):
         x_gate = self.fc1_g(x)
@@ -196,7 +189,7 @@ class GatedMlp(nn.Module):
 
 
 class ConvMlp(nn.Module):
-    """ MLP using 1x1 convs that keeps spatial dims (for 2D NCHW tensors)
+    """ MLP using 1x1 convs that keeps spatial dims
     """
     def __init__(
             self,
@@ -230,8 +223,6 @@ class ConvMlp(nn.Module):
 
 class GlobalResponseNormMlp(nn.Module):
     """ MLP w/ Global Response Norm (see grn.py), nn.Linear or 1x1 Conv2d
-
-    NOTE: Intended for '2D' NCHW (use_conv=True) or NHWC (use_conv=False, channels-last) tensor layouts
     """
     def __init__(
             self,

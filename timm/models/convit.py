@@ -21,19 +21,21 @@ Modifications and additions for timm hacked together by / Copyright 2021, Ross W
 '''These modules are adapted from those of timm, see
 https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
 '''
-from typing import Optional
+
+from functools import partial
 
 import torch
 import torch.nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import DropPath, trunc_normal_, PatchEmbed, Mlp, LayerNorm, HybridEmbed
+from timm.layers import DropPath, trunc_normal_, PatchEmbed, Mlp, LayerNorm
 from ._builder import build_model_with_cfg
 from ._features_fx import register_notrace_module
 from ._registry import register_model, generate_default_cfgs
+from .vision_transformer_hybrid import HybridEmbed
 
 
-__all__ = ['ConVit']
+__all__ = ['ConViT']
 
 
 @register_notrace_module  # reason: FX can't symbolically trace control flow in forward method
@@ -235,7 +237,7 @@ class Block(nn.Module):
         return x
 
 
-class ConVit(nn.Module):
+class ConViT(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
 
@@ -268,7 +270,7 @@ class ConVit(nn.Module):
         self.num_classes = num_classes
         self.global_pool = global_pool
         self.local_up_to_layer = local_up_to_layer
-        self.num_features = self.head_hidden_size = self.embed_dim = embed_dim  # for consistency with other models
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.locality_strength = locality_strength
         self.use_pos_embed = use_pos_embed
 
@@ -344,10 +346,10 @@ class ConVit(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('', 'token', 'avg')
@@ -383,7 +385,7 @@ def _create_convit(variant, pretrained=False, **kwargs):
     if kwargs.get('features_only', None):
         raise RuntimeError('features_only not implemented for Vision Transformer models.')
 
-    return build_model_with_cfg(ConVit, variant, pretrained, **kwargs)
+    return build_model_with_cfg(ConViT, variant, pretrained, **kwargs)
 
 
 def _cfg(url='', **kwargs):
@@ -405,7 +407,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def convit_tiny(pretrained=False, **kwargs) -> ConVit:
+def convit_tiny(pretrained=False, **kwargs):
     model_args = dict(
         local_up_to_layer=10, locality_strength=1.0, embed_dim=48, num_heads=4)
     model = _create_convit(variant='convit_tiny', pretrained=pretrained, **dict(model_args, **kwargs))
@@ -413,7 +415,7 @@ def convit_tiny(pretrained=False, **kwargs) -> ConVit:
 
 
 @register_model
-def convit_small(pretrained=False, **kwargs) -> ConVit:
+def convit_small(pretrained=False, **kwargs):
     model_args = dict(
         local_up_to_layer=10, locality_strength=1.0, embed_dim=48, num_heads=9)
     model = _create_convit(variant='convit_small', pretrained=pretrained, **dict(model_args, **kwargs))
@@ -421,7 +423,7 @@ def convit_small(pretrained=False, **kwargs) -> ConVit:
 
 
 @register_model
-def convit_base(pretrained=False, **kwargs) -> ConVit:
+def convit_base(pretrained=False, **kwargs):
     model_args = dict(
         local_up_to_layer=10, locality_strength=1.0, embed_dim=48, num_heads=16)
     model = _create_convit(variant='convit_base', pretrained=pretrained, **dict(model_args, **kwargs))

@@ -7,17 +7,16 @@ The official mindspore code is released and available at
 https://gitee.com/mindspore/mindspore/tree/master/model_zoo/research/cv/TNT
 """
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import Mlp, DropPath, trunc_normal_, _assert, to_2tuple, resample_abs_pos_embed
+from timm.layers import Mlp, DropPath, trunc_normal_, _assert, to_2tuple
 from ._builder import build_model_with_cfg
-from ._manipulate import checkpoint
 from ._registry import register_model
-
+from .vision_transformer import resize_pos_embed
 
 __all__ = ['TNT']  # model_registry will add each entrypoint fn to this
 
@@ -216,7 +215,7 @@ class TNT(nn.Module):
         assert global_pool in ('', 'token', 'avg')
         self.num_classes = num_classes
         self.global_pool = global_pool
-        self.num_features = self.head_hidden_size = self.embed_dim = embed_dim  # for consistency with other models
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.grad_checkpointing = False
 
         self.pixel_embed = PixelEmbed(
@@ -296,14 +295,13 @@ class TNT(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('', 'token', 'avg')
-            self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
@@ -340,11 +338,8 @@ class TNT(nn.Module):
 def checkpoint_filter_fn(state_dict, model):
     """ convert patch embedding weight from manual patchify + linear proj to conv"""
     if state_dict['patch_pos'].shape != model.patch_pos.shape:
-        state_dict['patch_pos'] = resample_abs_pos_embed(
-            state_dict['patch_pos'],
-            new_size=model.pixel_embed.grid_size,
-            num_prefix_tokens=1,
-        )
+        state_dict['patch_pos'] = resize_pos_embed(state_dict['patch_pos'],
+            model.patch_pos, getattr(model, 'num_tokens', 1), model.pixel_embed.grid_size)
     return state_dict
 
 
@@ -360,7 +355,7 @@ def _create_tnt(variant, pretrained=False, **kwargs):
 
 
 @register_model
-def tnt_s_patch16_224(pretrained=False, **kwargs) -> TNT:
+def tnt_s_patch16_224(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=16, embed_dim=384, inner_dim=24, depth=12, num_heads_outer=6,
         qkv_bias=False)
@@ -369,7 +364,7 @@ def tnt_s_patch16_224(pretrained=False, **kwargs) -> TNT:
 
 
 @register_model
-def tnt_b_patch16_224(pretrained=False, **kwargs) -> TNT:
+def tnt_b_patch16_224(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=16, embed_dim=640, inner_dim=40, depth=12, num_heads_outer=10,
         qkv_bias=False)

@@ -23,65 +23,59 @@ Acknowledgments:
 
 Hacked together by / Copyright 2020, Ross Wightman
 """
-import copy
 import logging
 import math
 from collections import OrderedDict
 from functools import partial
-from typing import Any, Callable, Dict, Optional, Set, Tuple, Type, Union, List
-try:
-    from typing import Literal
-except ImportError:
-    from typing_extensions import Literal
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch.jit import Final
+import pdb
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
-from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm, PatchDropout, SwiGLUPacked, SwiGLU, \
-    trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, use_fused_attn, \
-    get_act_layer, get_norm_layer, LayerType
+from timm.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_, resample_patch_embed, \
+    resample_abs_pos_embed, RmsNorm, PatchDropout, use_fused_attn
+from timm.layers.norm import LearnableScaler
 from ._builder import build_model_with_cfg
-from ._features import feature_take_indices
 from ._manipulate import named_apply, checkpoint_seq, adapt_input_conv
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
-from timm.layers.norm import LearnableScaler
 
 __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to this
 
 
 _logger = logging.getLogger(__name__)
 
-
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
     def __init__(
             self,
-            dim: int,
-            num_heads: int = 8,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            proj_bias: bool = True,
-            attn_drop: float = 0.,
-            proj_drop: float = 0.,
-            norm_layer: Type[nn.Module] = nn.LayerNorm,
-    ) -> None:
+            dim,
+            num_heads=8,
+            qkv_bias=False,
+            qk_norm=False,
+            attn_drop=0.,
+            proj_drop=0.,
+            norm_layer=nn.LayerNorm,
+    ):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
+        #self.fused_attn = use_fused_attn()
+        self.fused_attn = False
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.extra_loss = False
 
@@ -95,23 +89,42 @@ class Attention(nn.Module):
             return torch.tensor([0.]).to( attn.device )
         else:
             return 1 - torch.mean( bad_values_max )
+        #ipdb.set_trace()
+        values_min, _ = torch.min( attn, dim=-1 )
+        values_max, _ = torch.max( attn, dim=-1 )
+        values_mean = torch.mean( attn, dim=-1 )
+        ratio = (values_mean - values_min ) / (values_max - values_min )
+        bad_ratio = ratio[ratio > 0.5]
+        if len(bad_ratio) == 0:
+            return torch.tensor([0.]).to( attn.device )
+        else:
+            return torch.mean( bad_ratio )
+        res = torch.mean( (values_max - values_min )/ (torch.sum( attn, dim = -1 ) - len(attn) * values_min ) )
+        #return torch.clamp( res, 0)
+        if res > 0.5:
+            return torch.tensor([0.]).to( attn.device )
+        return 1 - res
 
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
+        #pdb.set_trace()
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-
-        if self.fused_attn and (not self.extra_loss):
+        #ipdb.set_trace()
+        if self.fused_attn or (not self.extra_loss):
             x = F.scaled_dot_product_attention(
                 q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                dropout_p=self.attn_drop.p,
             )
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
+            #if torch.any( torch.isnan(attn) ):
+            #    pdb.set_trace()
+
+            #if self.extra_loss:
             extra_loss = self.compute_extra_loss( attn )
             attn = self.attn_drop(attn)
             x = attn @ v
@@ -125,68 +138,80 @@ class Attention(nn.Module):
 
 
 class LayerScale(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            init_values: float = 1e-5,
-            inplace: bool = False,
-    ) -> None:
+    def __init__(self, dim, init_values=1e-5, inplace=False):
         super().__init__()
         self.inplace = inplace
         self.gamma = nn.Parameter(init_values * torch.ones(dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
 
 class Block(nn.Module):
+
     def __init__(
             self,
-            dim: int,
-            num_heads: int,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            proj_bias: bool = True,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            init_values: Optional[float] = None,
-            drop_path: float = 0.,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = nn.LayerNorm,
-            mlp_layer: Type[nn.Module] = Mlp,
-    ) -> None:
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            qk_norm=False,
+            proj_drop=0.,
+            attn_drop=0.,
+            init_values=None,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+            new_skip_connection=False,
+            mlp_type=Mlp,
+            attn_extra=False,
+    ):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
-            proj_bias=proj_bias,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-            norm_layer=norm_layer,
-        )
+        if attn_extra:
+            self.attn = AttentionExtra(
+                    dim,
+                    num_heads=num_heads,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    norm_layer=norm_layer,
+                    )
+        else:
+            self.attn = Attention(
+                    dim,
+                    num_heads=num_heads,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    norm_layer=norm_layer,
+                    )
+        #ipdb.set_trace()
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = mlp_layer(
+        #pdb.set_trace()
+        #self.mlp = Mlp(
+        self.mlp = mlp_type(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
-            bias=proj_bias,
             drop=proj_drop,
         )
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
+        self.skip0 = norm_layer(dim) if new_skip_connection else nn.Identity()
+        self.skip1 = norm_layer(dim) if new_skip_connection else nn.Identity()
+
         self.is_return_feature_decay = False
         self.feature_decay_scale = 0
         self.is_return_attn_extra_loss = False
         self.att_extra_loss_scale = 0
-
+        #self.feature_max = torch.nn.Parameter( torch.Tensor( [ 200 ] ) )
 
     def set_return_feature_decay( self, value, scale ):
         self.is_return_feature_decay = value
@@ -197,55 +222,66 @@ class Block(nn.Module):
         self.attn.set_return_extra_loss( value )
         self.attn_extra_loss_scale = scale
 
+    def set_noise( self ):
+        self.norm1.set_use_noise( True )
+        self.norm2.set_use_noise( True )
+
     def compute_feature_decay_loss( self, features):
-        absolute = torch.abs( features )
+        absolute = torch.absolute(features)
         danger = absolute[ absolute > 200 ] - 200
         if len(danger) > 0:
             return (torch.mean( danger ) + torch.max( danger ))
         return torch.tensor([0.]).to( features.device )
 
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-         if isinstance( x, tuple ): #first block
+    def forward(self, x):
+        if isinstance( x, tuple ): #first block
             x_, feature_decay_loss = x
-         else:
+        else:
             x_ = x
             feature_decay_loss = torch.tensor([0.]).to( x.device )
 
-         if (not self.is_return_feature_decay) or (not self.training):
+        if (not self.is_return_feature_decay) or (not self.training):
             x_ = x_ + self.drop_path1(self.ls1(self.attn(self.norm1(x_))))
             x_ = x_ + self.drop_path2(self.ls2(self.mlp(self.norm2(x_))))
             return x_, feature_decay_loss
-         assert self.is_return_feature_decay
-         #assert len(x) == 2
-         if self.is_return_attn_extra_loss:
+        #assert self.is_return_feature_decay
+        #assert len(x) == 2
+        #x_, feature_decay_loss = x
+        if self.is_return_attn_extra_loss:
             attn_val, attn_extra_loss = self.attn(self.norm1(x_))
             x_ = x_ + self.drop_path1(self.ls1(attn_val))
             feature_decay_loss += attn_extra_loss * self.attn_extra_loss_scale
-         else:
+        else:
             x_ = x_ + self.drop_path1(self.ls1(self.attn(self.norm1(x_))))
-         x_ = x_ + self.drop_path2(self.ls2(self.mlp(self.norm2(x_))))
-         feature_decay_loss += self.compute_feature_decay_loss( x_ ) * self.feature_decay_scale
-         return x_, feature_decay_loss
+        #pdb.set_trace()
+        feature_decay_loss += self.compute_feature_decay_loss( x_ ) * self.feature_decay_scale
+        #x_ = torch.clamp( x_, min = -150, max = 150)
+        x_ = x_ + self.drop_path2(self.ls2(self.mlp(self.norm2(x_))))
+        feature_decay_loss += self.compute_feature_decay_loss( x_ ) * self.feature_decay_scale
+        #x_ = torch.clamp( x_, min = -150, max = 150)
+        #x_ = torch.clamp( x_, min = -100, max = 100)
+        return (x_, feature_decay_loss)
+
+
+
 
 
 class ResPostBlock(nn.Module):
+
     def __init__(
             self,
-            dim: int,
-            num_heads: int,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            proj_bias: bool = True,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            init_values: Optional[float] = None,
-            drop_path: float = 0.,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = nn.LayerNorm,
-            mlp_layer: Type[nn.Module] = Mlp,
-    ) -> None:
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            qk_norm=False,
+            proj_drop=0.,
+            attn_drop=0.,
+            init_values=None,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm
+    ):
         super().__init__()
         self.init_values = init_values
 
@@ -254,7 +290,6 @@ class ResPostBlock(nn.Module):
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,
-            proj_bias=proj_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             norm_layer=norm_layer,
@@ -262,11 +297,10 @@ class ResPostBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        self.mlp = mlp_layer(
+        self.mlp = Mlp(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
-            bias=proj_bias,
             drop=proj_drop,
         )
         self.norm2 = norm_layer(dim)
@@ -274,13 +308,13 @@ class ResPostBlock(nn.Module):
 
         self.init_weights()
 
-    def init_weights(self) -> None:
+    def init_weights(self):
         # NOTE this init overrides that base model init with specific changes for the block type
         if self.init_values is not None:
             nn.init.constant_(self.norm1.weight, self.init_values)
             nn.init.constant_(self.norm2.weight, self.init_values)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = x + self.drop_path1(self.norm1(self.attn(x)))
         x = x + self.drop_path2(self.norm2(self.mlp(x)))
         return x
@@ -295,20 +329,18 @@ class ParallelScalingBlock(nn.Module):
 
     def __init__(
             self,
-            dim: int,
-            num_heads: int,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            proj_bias: bool = True,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            init_values: Optional[float] = None,
-            drop_path: float = 0.,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = nn.LayerNorm,
-            mlp_layer: Optional[Type[nn.Module]] = None,
-    ) -> None:
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            qk_norm=False,
+            proj_drop=0.,
+            attn_drop=0.,
+            init_values=None,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm
+    ):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -331,16 +363,16 @@ class ParallelScalingBlock(nn.Module):
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
-        self.attn_out_proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.attn_out_proj = nn.Linear(dim, dim)
 
         self.mlp_drop = nn.Dropout(proj_drop)
         self.mlp_act = act_layer()
-        self.mlp_out_proj = nn.Linear(mlp_hidden_dim, dim, bias=proj_bias)
+        self.mlp_out_proj = nn.Linear(mlp_hidden_dim, dim)
 
         self.ls = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, N, C = x.shape
 
         # Combined MLP fc1 & qkv projections
@@ -360,7 +392,7 @@ class ParallelScalingBlock(nn.Module):
         if self.fused_attn:
             x_attn = F.scaled_dot_product_attention(
                 q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                dropout_p=self.attn_drop.p,
             )
         else:
             q = q * self.scale
@@ -389,21 +421,19 @@ class ParallelThingsBlock(nn.Module):
     """
     def __init__(
             self,
-            dim: int,
-            num_heads: int,
-            num_parallel: int = 2,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            proj_bias: bool = True,
-            init_values: Optional[float] = None,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            drop_path: float = 0.,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = nn.LayerNorm,
-            mlp_layer: Type[nn.Module] = Mlp,
-    ) -> None:
+            dim,
+            num_heads,
+            num_parallel=2,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            qk_norm=False,
+            init_values=None,
+            proj_drop=0.,
+            attn_drop=0.,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm
+    ):
         super().__init__()
         self.num_parallel = num_parallel
         self.attns = nn.ModuleList()
@@ -416,7 +446,6 @@ class ParallelThingsBlock(nn.Module):
                     num_heads=num_heads,
                     qkv_bias=qkv_bias,
                     qk_norm=qk_norm,
-                    proj_bias=proj_bias,
                     attn_drop=attn_drop,
                     proj_drop=proj_drop,
                     norm_layer=norm_layer,
@@ -426,58 +455,32 @@ class ParallelThingsBlock(nn.Module):
             ])))
             self.ffns.append(nn.Sequential(OrderedDict([
                 ('norm', norm_layer(dim)),
-                ('mlp', mlp_layer(
+                ('mlp', Mlp(
                     dim,
                     hidden_features=int(dim * mlp_ratio),
                     act_layer=act_layer,
-                    bias=proj_bias,
                     drop=proj_drop,
                 )),
                 ('ls', LayerScale(dim, init_values=init_values) if init_values else nn.Identity()),
                 ('drop_path', DropPath(drop_path) if drop_path > 0. else nn.Identity())
             ])))
 
-    def _forward_jit(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_jit(self, x):
         x = x + torch.stack([attn(x) for attn in self.attns]).sum(dim=0)
         x = x + torch.stack([ffn(x) for ffn in self.ffns]).sum(dim=0)
         return x
 
     @torch.jit.ignore
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward(self, x):
         x = x + sum(attn(x) for attn in self.attns)
         x = x + sum(ffn(x) for ffn in self.ffns)
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             return self._forward_jit(x)
         else:
             return self._forward(x)
-
-
-def global_pool_nlc(
-        x: torch.Tensor,
-        pool_type: str = 'token',
-        num_prefix_tokens: int = 1,
-        reduce_include_prefix: bool = False,
-):
-    if not pool_type:
-        return x
-
-    if pool_type == 'token':
-        x = x[:, 0]  # class token
-    else:
-        x = x if reduce_include_prefix else x[:, num_prefix_tokens:]
-        if pool_type == 'avg':
-            x = x.mean(dim=1)
-        elif pool_type == 'avgmax':
-            x = 0.5 * (x.amax(dim=1) + x.mean(dim=1))
-        elif pool_type == 'max':
-            x = x.amax(dim=1)
-        else:
-            assert not pool_type, f'Unknown pool type {pool_type}'
-
-    return x
 
 
 class VisionTransformer(nn.Module):
@@ -486,7 +489,6 @@ class VisionTransformer(nn.Module):
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
         - https://arxiv.org/abs/2010.11929
     """
-    dynamic_img_size: Final[bool]
 
     def __init__(
             self,
@@ -494,45 +496,41 @@ class VisionTransformer(nn.Module):
             patch_size: Union[int, Tuple[int, int]] = 16,
             in_chans: int = 3,
             num_classes: int = 1000,
-            global_pool: Literal['', 'avg', 'avgmax', 'max', 'token', 'map'] = 'token',
+            global_pool: str = 'token',
             embed_dim: int = 768,
             depth: int = 12,
             num_heads: int = 12,
             mlp_ratio: float = 4.,
             qkv_bias: bool = True,
             qk_norm: bool = False,
-            proj_bias: bool = True,
             init_values: Optional[float] = None,
             class_token: bool = True,
-            pos_embed: str = 'learn',
             no_embed_class: bool = False,
-            reg_tokens: int = 0,
             pre_norm: bool = False,
-            final_norm: bool = True,
             fc_norm: Optional[bool] = None,
-            dynamic_img_size: bool = False,
-            dynamic_img_pad: bool = False,
             drop_rate: float = 0.,
             pos_drop_rate: float = 0.,
             patch_drop_rate: float = 0.,
             proj_drop_rate: float = 0.,
             attn_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
-            weight_init: Literal['skip', 'jax', 'jax_nlhb', 'moco', ''] = '',
-            fix_init: bool = False,
+            weight_init: str = '',
             embed_layer: Callable = PatchEmbed,
-            embed_norm_layer: Optional[LayerType] = None,
-            norm_layer: Optional[LayerType] = None,
-            act_layer: Optional[LayerType] = None,
-            block_fn: Type[nn.Module] = Block,
-            mlp_layer: Type[nn.Module] = Mlp,
-    ) -> None:
+            norm_layer: Optional[Callable] = None,
+            act_layer: Optional[Callable] = None,
+            block_fn: Callable = Block,
+            combining_classifier=False,
+            new_skip_connection=False,
+            mlp_type=Mlp,
+            mlp_n_layers=0,
+            attn_extra=False,
+    ):
         """
         Args:
             img_size: Input image size.
             patch_size: Patch size.
             in_chans: Number of image input channels.
-            num_classes: Number of classes for classification head.
+            num_classes: Mumber of classes for classification head.
             global_pool: Type of global pooling for final sequence (default: 'token').
             embed_dim: Transformer embedding dimension.
             depth: Depth of transformer.
@@ -541,68 +539,45 @@ class VisionTransformer(nn.Module):
             qkv_bias: Enable bias for qkv projections if True.
             init_values: Layer-scale init values (layer-scale enabled if not None).
             class_token: Use class token.
-            no_embed_class: Don't include position embeddings for class (or reg) tokens.
-            reg_tokens: Number of register tokens.
-            pre_norm: Enable norm after embeddings, before transformer blocks (standard in CLIP ViT).
-            final_norm: Enable norm after transformer blocks, before head (standard in most ViT).
-            fc_norm: Move final norm after pool (instead of before), if None, enabled when global_pool == 'avg'.
+            fc_norm: Pre head norm after pool (instead of before), if None, enabled when global_pool == 'avg'.
             drop_rate: Head dropout rate.
             pos_drop_rate: Position embedding dropout rate.
             attn_drop_rate: Attention dropout rate.
             drop_path_rate: Stochastic depth rate.
             weight_init: Weight initialization scheme.
-            fix_init: Apply weight initialization fix (scaling w/ layer index).
-            embed_layer: Patch embedding layer.
-            embed_norm_layer: Normalization layer to use / override in patch embed module.
+            embed_layer: Patch embedding layey.
             norm_layer: Normalization layer.
             act_layer: MLP activation layer.
             block_fn: Transformer block layer.
         """
+        #ipdb.set_trace()
         super().__init__()
-        assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map')
+        assert global_pool in ('', 'avg', 'token')
         assert class_token or global_pool != 'token'
-        assert pos_embed in ('', 'none', 'learn')
-        use_fc_norm = global_pool in ('avg', 'avgmax', 'max') if fc_norm is None else fc_norm
-        norm_layer = get_norm_layer(norm_layer) or partial(nn.LayerNorm, eps=1e-6)
-        embed_norm_layer = get_norm_layer(embed_norm_layer)
-        act_layer = get_act_layer(act_layer) or nn.GELU
+        use_fc_norm = global_pool == 'avg' if fc_norm is None else fc_norm
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        act_layer = act_layer or nn.GELU
 
         self.num_classes = num_classes
         self.global_pool = global_pool
-        self.num_features = self.head_hidden_size = self.embed_dim = embed_dim  # for consistency with other models
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.num_prefix_tokens = 1 if class_token else 0
-        self.num_prefix_tokens += reg_tokens
-        self.num_reg_tokens = reg_tokens
-        self.has_class_token = class_token
-        self.no_embed_class = no_embed_class  # don't embed prefix positions (includes reg)
-        self.dynamic_img_size = dynamic_img_size
+        self.no_embed_class = no_embed_class
         self.grad_checkpointing = False
+        self.combining_classifier = combining_classifier
 
-        embed_args = {}
-        if dynamic_img_size:
-            # flatten deferred until after pos embed
-            embed_args.update(dict(strict_img_size=False, output_fmt='NHWC'))
-        if embed_norm_layer is not None:
-            embed_args['norm_layer'] = embed_norm_layer
         self.patch_embed = embed_layer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
             bias=not pre_norm,  # disable bias if pre-norm is used (e.g. CLIP)
-            dynamic_img_pad=dynamic_img_pad,
-            **embed_args,
         )
         num_patches = self.patch_embed.num_patches
-        reduction = self.patch_embed.feat_ratio() if hasattr(self.patch_embed, 'feat_ratio') else patch_size
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if class_token else None
-        self.reg_token = nn.Parameter(torch.zeros(1, reg_tokens, embed_dim)) if reg_tokens else None
         embed_len = num_patches if no_embed_class else num_patches + self.num_prefix_tokens
-        if not pos_embed or pos_embed == 'none':
-            self.pos_embed = None
-        else:
-            self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * .02)
+        self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * .02)
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
         if patch_drop_rate > 0:
             self.patch_drop = PatchDropout(
@@ -621,38 +596,32 @@ class VisionTransformer(nn.Module):
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
                 qk_norm=qk_norm,
-                proj_bias=proj_bias,
                 init_values=init_values,
                 proj_drop=proj_drop_rate,
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
                 act_layer=act_layer,
-                mlp_layer=mlp_layer,
+                new_skip_connection=new_skip_connection,
+                mlp_type=mlp_type,
             )
             for i in range(depth)])
-        self.feature_info = [
-            dict(module=f'blocks.{i}', num_chs=embed_dim, reduction=reduction) for i in range(depth)]
-        self.norm = norm_layer(embed_dim) if final_norm and not use_fc_norm else nn.Identity()
+        #pdb.set_trace()
+
+        self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
         # Classifier Head
-        if global_pool == 'map':
-            self.attn_pool = AttentionPoolLatent(
-                self.embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                norm_layer=norm_layer,
-            )
-        else:
-            self.attn_pool = None
-        self.fc_norm = norm_layer(embed_dim) if final_norm and use_fc_norm else nn.Identity()
+        self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
         self.head_drop = nn.Dropout(drop_rate)
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        #self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        input_dim = self.embed_dim if not self.combining_classifier else self.embed_dim * 2
+        self.head = nn.Linear( input_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
-        if fix_init:
-            self.fix_init_weight()
+        self.switch_index = 0
+        self.learnable_blocks_len = 0
+        self.is_return_mlp_extra_loss = False
 
     def set_return_feature_decay( self, val, scale ):
         self.is_return_feature_decay = val
@@ -665,230 +634,158 @@ class VisionTransformer(nn.Module):
         for idx in range(layers):
             self.blocks[idx].set_return_attn_extra_loss( val, scale )
 
-    def fix_init_weight(self):
-        def rescale(param, _layer_id):
-            param.div_(math.sqrt(2.0 * _layer_id))
+    def get_params_set( self, n_layers ):
+        block_names = []
+        block_names = [f'blocks.{idx}.' for idx in range( n_layers )]
+        block_names.append( 'patch_embed' )
+        first_group, second_group = [], []
+        def is_found( name, selected_names ):
+            for radical in selected_names:
+                if name.find( radical ) != -1:
+                    return True
+            return False
+        #pdb.set_trace()
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if is_found( name, block_names ):
+                first_group.append( param )
+            else:
+                second_group.append( param )
+        return first_group, second_group
 
-        for layer_id, layer in enumerate(self.blocks):
-            rescale(layer.attn.proj.weight.data, layer_id + 1)
-            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def init_weights(self, mode: str = '') -> None:
+
+
+    def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
-        if self.pos_embed is not None:
-            trunc_normal_(self.pos_embed, std=.02)
+        trunc_normal_(self.pos_embed, std=.02)
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, std=1e-6)
-        if self.reg_token is not None:
-            nn.init.normal_(self.reg_token, std=1e-6)
         named_apply(get_init_weights_vit(mode, head_bias), self)
 
-    def _init_weights(self, m: nn.Module) -> None:
+    def _init_weights(self, m):
         # this fn left here for compat with downstream users
         init_weights_vit_timm(m)
 
     @torch.jit.ignore()
-    def load_pretrained(self, checkpoint_path: str, prefix: str = '') -> None:
+    def load_pretrained(self, checkpoint_path, prefix=''):
         _load_weights(self, checkpoint_path, prefix)
 
     @torch.jit.ignore
-    def no_weight_decay(self) -> Set:
+    def no_weight_decay(self):
         return {'pos_embed', 'cls_token', 'dist_token'}
 
     @torch.jit.ignore
-    def group_matcher(self, coarse: bool = False) -> Dict:
+    def group_matcher(self, coarse=False):
         return dict(
             stem=r'^cls_token|pos_embed|patch_embed',  # stem and embed
             blocks=[(r'^blocks\.(\d+)', None), (r'^norm', (99999,))]
         )
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable: bool = True) -> None:
+    def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
-        if hasattr(self.patch_embed, 'set_grad_checkpointing'):
-            self.patch_embed.set_grad_checkpointing(enable)
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes: int, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
-            assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map')
-            if global_pool == 'map' and self.attn_pool is None:
-                assert False, "Cannot currently add attention pooling in reset_classifier()."
-            elif global_pool != 'map' and self.attn_pool is not None:
-                self.attn_pool = None  # remove attention pooling
+            assert global_pool in ('', 'avg', 'token')
             self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def set_input_size(
-            self,
-            img_size: Optional[Tuple[int, int]] = None,
-            patch_size: Optional[Tuple[int, int]] = None,
-    ):
-        """Method updates the input image resolution, patch size
-
-        Args:
-            img_size: New input resolution, if None current resolution is used
-            patch_size: New patch size, if None existing patch size is used
-        """
-        prev_grid_size = self.patch_embed.grid_size
-        self.patch_embed.set_input_size(img_size=img_size, patch_size=patch_size)
-        if self.pos_embed is not None:
-            num_prefix_tokens = 0 if self.no_embed_class else self.num_prefix_tokens
-            num_new_tokens = self.patch_embed.num_patches + num_prefix_tokens
-            if num_new_tokens != self.pos_embed.shape[1]:
-                self.pos_embed = nn.Parameter(resample_abs_pos_embed(
-                    self.pos_embed,
-                    new_size=self.patch_embed.grid_size,
-                    old_size=prev_grid_size,
-                    num_prefix_tokens=num_prefix_tokens,
-                    verbose=True,
-                ))
-
-    def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
-        if self.pos_embed is None:
-            return x.view(x.shape[0], -1, x.shape[-1])
-
-        if self.dynamic_img_size:
-            B, H, W, C = x.shape
-            prev_grid_size = self.patch_embed.grid_size
-            pos_embed = resample_abs_pos_embed(
-                self.pos_embed,
-                new_size=(H, W),
-                old_size=prev_grid_size,
-                num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
-            )
-            x = x.view(B, -1, C)
-        else:
-            pos_embed = self.pos_embed
-
-        to_cat = []
-        if self.cls_token is not None:
-            to_cat.append(self.cls_token.expand(x.shape[0], -1, -1))
-        if self.reg_token is not None:
-            to_cat.append(self.reg_token.expand(x.shape[0], -1, -1))
-
+    def _pos_embed(self, x):
         if self.no_embed_class:
             # deit-3, updated JAX (big vision)
             # position embedding does not overlap with class token, add then concat
-            x = x + pos_embed
-            if to_cat:
-                x = torch.cat(to_cat + [x], dim=1)
+            x = x + self.pos_embed
+            if self.cls_token is not None:
+                x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         else:
             # original timm, JAX, and deit vit impl
             # pos_embed has entry for class token, concat then add
-            if to_cat:
-                x = torch.cat(to_cat + [x], dim=1)
-            x = x + pos_embed
-
+            if self.cls_token is not None:
+                x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+            x = x + self.pos_embed
         return self.pos_drop(x)
 
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            indices: Optional[Union[int, List[int]]] = None,
-            return_prefix_tokens: bool = False,
-            norm: bool = False,
-            stop_early: bool = False,
-            output_fmt: str = 'NCHW',
-            intermediates_only: bool = False,
-    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
+    def set_learnable_blocks( self, blocks_len ):
+        #ipdb.set_trace()
+        n_blocks = len( self.blocks )
+        assert blocks_len <= n_blocks and blocks_len > 0
+        self.switch_index = 0
+        self.learnable_blocks_len = blocks_len
+        self.blocks.train(False)
+        self.switch_block( self.switch_index, True )
 
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            return_prefix_tokens: Return both prefix and spatial intermediate tokens
-            norm: Apply norm layer to all intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-        Returns:
+    '''def set_num_switches(self, num_switches):
+        #ipdb.set_trace()
+        n_blocks = len( self.blocks )
+        assert num_switches < n_blocks, f'num_switches {num_switch} must be less than number of blocks {len(self.blocks)}'
+        self.num_switches = num_switches
+        if num_switches < 1:
+            self.blocks.train(True)
+            return
+        self.switch_index = 0
+        self.switch_section_len = n_blocks // self.num_switches
+        self.blocks.train(False)'''
 
-        """
-        assert output_fmt in ('NCHW', 'NLC'), 'Output format must be one of NCHW or NLC.'
-        reshape = output_fmt == 'NCHW'
-        intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
+    def switch_block(self, idx, value ):
+        #if value == False:
+        #    ipdb.set_trace()
+        n_blocks = len( self.blocks )
+        starting_idx = self.switch_index * self.learnable_blocks_len
+        ending_idx = min( starting_idx + self.learnable_blocks_len, len(self.blocks))
+        if starting_idx < ending_idx:
+            y = self.blocks[starting_idx:ending_idx]
+            y.train(value)
+            for param in y.parameters():
+                param.requires_grad_( value )
 
-        # forward pass
-        B, _, height, width = x.shape
+    def get_block_output(self, x, block_id):
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
+        feature_decay_loss = torch.tensor([0.]).to( x.device )
+        x, feature_decay_loss = self.blocks[:block_id]((x, feature_decay_loss))
+        return x
 
-        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
-            blocks = self.blocks
+
+    def forward_features(self, x):
+        #ipdb.set_trace()
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+        #ipdb.set_trace()
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            x = checkpoint_seq(self.blocks, x)
         else:
-            blocks = self.blocks[:max_index + 1]
-        for i, blk in enumerate(blocks):
-            x = blk(x)
-            if i in take_indices:
-                # normalize intermediates with final norm layer if enabled
-                intermediates.append(self.norm(x) if norm else x)
-
-        # process intermediates
-        if self.num_prefix_tokens:
-            # split prefix (e.g. class, distill) and spatial feature tokens
-            prefix_tokens = [y[:, 0:self.num_prefix_tokens] for y in intermediates]
-            intermediates = [y[:, self.num_prefix_tokens:] for y in intermediates]
-        if reshape:
-            # reshape to BCHW output format
-            H, W = self.patch_embed.dynamic_feat_size((height, width))
-            intermediates = [y.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous() for y in intermediates]
-        if not torch.jit.is_scripting() and return_prefix_tokens:
-            # return_prefix not support in torchscript due to poor type handling
-            intermediates = list(zip(intermediates, prefix_tokens))
-
-        if intermediates_only:
-            return intermediates
-
+            #if self.training and self.num_switches > 1:
+            if self.training and self.learnable_blocks_len > 0:
+                #ipdb.set_trace()
+                #self.blocks.eval()
+                #turn off current switch section
+                self.switch_block( self.switch_index, False )
+                self.switch_index += 1
+                if self.switch_index * self.learnable_blocks_len >= len( self.blocks )  :
+                    self.switch_index = 0
+                self.switch_block( self.switch_index, True )
+                #increase switch index
+                #turn on new switch section
+            #ipdb.set_trace()
+            feature_decay_loss = torch.tensor([0.]).to( x.device )
+            x, feature_decay_loss = self.blocks((x, feature_decay_loss))
         x = self.norm(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
-        self.blocks = self.blocks[:max_index + 1]  # truncate blocks
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
-            self.fc_norm = nn.Identity()
-            self.reset_classifier(0, '')
-        return take_indices
-
-    def get_intermediate_layers(
-            self,
-            x: torch.Tensor,
-            n: Union[int, List[int], Tuple[int]] = 1,
-            reshape: bool = False,
-            return_prefix_tokens: bool = False,
-            norm: bool = False,
-    ) -> List[torch.Tensor]:
-        """ Intermediate layer accessor inspired by DINO / DINOv2 interface.
-        NOTE: This API is for backwards compat, favour using forward_intermediates() directly.
-        """
-        return self.forward_intermediates(
-            x, n,
-            return_prefix_tokens=return_prefix_tokens,
-            norm=norm,
-            output_fmt='NCHW' if reshape else 'NLC',
-            intermediates_only=True,
-        )
-
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        return x, feature_decay_loss
+    
+    def forward_prenorm( self, x ):
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
@@ -897,35 +794,33 @@ class VisionTransformer(nn.Module):
             x = checkpoint_seq(self.blocks, x)
         else:
             feature_decay_loss = torch.tensor([0.]).to( x.device )
-            x, feature_decay_loss = self.blocks((x, feature_decay_loss))
-        x = self.norm(x)
-        return x, feature_decay_loss
-
-    def pool(self, x: torch.Tensor, pool_type: Optional[str] = None) -> torch.Tensor:
-        if self.attn_pool is not None:
-            x = self.attn_pool(x)
-            return x
-        pool_type = self.global_pool if pool_type is None else pool_type
-        x = global_pool_nlc(x, pool_type=pool_type, num_prefix_tokens=self.num_prefix_tokens)
+            x, _ = self.blocks((x,feature_decay_loss))
         return x
 
-    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
-        x = self.pool(x)
+    def forward_head(self, x, pre_logits: bool = False):
+        #ipdb.set_trace()
+        if self.global_pool:
+            #x = x[:, self.num_prefix_tokens:].mean(dim=1) if self.global_pool == 'avg' else x[:, 0]
+            if self.combining_classifier:
+                x = torch.cat((x[:, self.num_prefix_tokens:].mean(dim=1), x[:,0]), dim=1)
+            else:
+                x = x[:, self.num_prefix_tokens:].mean(dim=1) if self.global_pool == 'avg' else x[:, 0]
+
         x = self.fc_norm(x)
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x_, feature_decay_loss = self.forward_features(x)
         x_ = self.forward_head(x_)
         if self.training and self.is_return_feature_decay:
             return x_, feature_decay_loss
         else:
-            #pdb.set_trace()
+            #ipdb.set_trace()
             return x_
 
 
-def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
+def init_weights_vit_timm(module: nn.Module, name: str = ''):
     """ ViT weight initialization, original timm impl (for reproducibility) """
     if isinstance(module, nn.Linear):
         trunc_normal_(module.weight, std=.02)
@@ -935,7 +830,7 @@ def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
         module.init_weights()
 
 
-def init_weights_vit_jax(module: nn.Module, name: str = '', head_bias: float = 0.0) -> None:
+def init_weights_vit_jax(module: nn.Module, name: str = '', head_bias: float = 0.):
     """ ViT weight initialization, matching JAX (Flax) impl """
     if isinstance(module, nn.Linear):
         if name.startswith('head'):
@@ -953,7 +848,7 @@ def init_weights_vit_jax(module: nn.Module, name: str = '', head_bias: float = 0
         module.init_weights()
 
 
-def init_weights_vit_moco(module: nn.Module, name: str = '') -> None:
+def init_weights_vit_moco(module: nn.Module, name: str = ''):
     """ ViT weight initialization, matching moco-v3 impl minus fixed PatchEmbed """
     if isinstance(module, nn.Linear):
         if 'qkv' in name:
@@ -968,7 +863,7 @@ def init_weights_vit_moco(module: nn.Module, name: str = '') -> None:
         module.init_weights()
 
 
-def get_init_weights_vit(mode: str = 'jax', head_bias: float = 0.0) -> Callable:
+def get_init_weights_vit(mode='jax', head_bias: float = 0.):
     if 'jax' in mode:
         return partial(init_weights_vit_jax, head_bias=head_bias)
     elif 'moco' in mode:
@@ -978,65 +873,57 @@ def get_init_weights_vit(mode: str = 'jax', head_bias: float = 0.0) -> Callable:
 
 
 def resize_pos_embed(
-        posemb: torch.Tensor,
-        posemb_new: torch.Tensor,
-        num_prefix_tokens: int = 1,
-        gs_new: Tuple[int, int] = (),
-        interpolation: str = 'bicubic',
-        antialias: bool = False,
-) -> torch.Tensor:
+        posemb,
+        posemb_new,
+        num_prefix_tokens=1,
+        gs_new=(),
+        interpolation='bicubic',
+        antialias=False,
+):
     """ Rescale the grid of position embeddings when loading from state_dict.
-    *DEPRECATED* This function is being deprecated in favour of using resample_abs_pos_embed
+
+    *DEPRECATED* This function is being deprecated in favour of resample_abs_pos_embed
+
+    Adapted from:
+        https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
     """
-    ntok_new = posemb_new.shape[1] - num_prefix_tokens
-    ntok_old = posemb.shape[1] - num_prefix_tokens
-    gs_old = [int(math.sqrt(ntok_old))] * 2
+    ntok_new = posemb_new.shape[1]
+    if num_prefix_tokens:
+        posemb_prefix, posemb_grid = posemb[:, :num_prefix_tokens], posemb[0, num_prefix_tokens:]
+        ntok_new -= num_prefix_tokens
+    else:
+        posemb_prefix, posemb_grid = posemb[:, :0], posemb[0]
+    gs_old = int(math.sqrt(len(posemb_grid)))
     if not len(gs_new):  # backwards compatibility
         gs_new = [int(math.sqrt(ntok_new))] * 2
-    return resample_abs_pos_embed(
-        posemb, gs_new, gs_old,
-        num_prefix_tokens=num_prefix_tokens,
-        interpolation=interpolation,
-        antialias=antialias,
-        verbose=True,
-    )
+    assert len(gs_new) >= 2
+    _logger.info(f'Resized position embedding: {posemb.shape} ({[gs_old, gs_old]}) to {posemb_new.shape} ({gs_new}).')
+    posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
+    posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode=interpolation, antialias=antialias, align_corners=False)
+    posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, gs_new[0] * gs_new[1], -1)
+    posemb = torch.cat([posemb_prefix, posemb_grid], dim=1)
+    return posemb
 
 
 @torch.no_grad()
-def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = '', load_bfloat16: bool = False) -> None:
+def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = ''):
     """ Load weights from .npz checkpoints for official Google Brain Flax implementation
     """
     import numpy as np
-    if load_bfloat16:
-        import jax.numpy as jnp
-        import ml_dtypes
 
-    def _n2p(_w, t=True, idx=None):
-        if idx is not None:
-            _w = _w[idx]
-
-        if load_bfloat16:
-            _w = _w.view(ml_dtypes.bfloat16).astype(jnp.float32)
-            _w = np.array(_w)
-
-        if _w.ndim == 4 and _w.shape[0] == _w.shape[1] == _w.shape[2] == 1:
-            _w = _w.flatten()
+    def _n2p(w, t=True):
+        if w.ndim == 4 and w.shape[0] == w.shape[1] == w.shape[2] == 1:
+            w = w.flatten()
         if t:
-            if _w.ndim == 4:
-                _w = _w.transpose([3, 2, 0, 1])
-            elif _w.ndim == 3:
-                _w = _w.transpose([2, 0, 1])
-            elif _w.ndim == 2:
-                _w = _w.transpose([1, 0])
+            if w.ndim == 4:
+                w = w.transpose([3, 2, 0, 1])
+            elif w.ndim == 3:
+                w = w.transpose([2, 0, 1])
+            elif w.ndim == 2:
+                w = w.transpose([1, 0])
+        return torch.from_numpy(w)
 
-        _w = torch.from_numpy(_w)
-        return _w
-
-    if load_bfloat16:
-        w = jnp.load(checkpoint_path)
-    else:
-        w = np.load(checkpoint_path)
-
+    w = np.load(checkpoint_path)
     interpolation = 'bilinear'
     antialias = False
     big_vision = False
@@ -1045,9 +932,6 @@ def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = 
             prefix = 'opt/target/'
         elif 'params/embedding/kernel' in w:
             prefix = 'params/'
-            big_vision = True
-        elif 'params/img/embedding/kernel' in w:
-            prefix = 'params/img/'
             big_vision = True
 
     if hasattr(model.patch_embed, 'backbone'):
@@ -1092,6 +976,7 @@ def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = 
     else:
         pos_embed_w = _n2p(w[f'{prefix}Transformer/posembed_input/pos_embedding'], t=False)
     if pos_embed_w.shape != model.pos_embed.shape:
+        old_shape = pos_embed_w.shape
         num_prefix_tokens = 0 if getattr(model, 'no_embed_class', False) else getattr(model, 'num_prefix_tokens', 1)
         pos_embed_w = resample_abs_pos_embed(  # resize pos embedding when different size from pretrained weights
             pos_embed_w,
@@ -1104,81 +989,42 @@ def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = 
     model.pos_embed.copy_(pos_embed_w)
     model.norm.weight.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/scale']))
     model.norm.bias.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/bias']))
-    if (isinstance(model.head, nn.Linear) and
-            f'{prefix}head/bias' in w and
-            model.head.bias.shape[0] == w[f'{prefix}head/bias'].shape[-1]):
+    if isinstance(model.head, nn.Linear) and model.head.bias.shape[0] == w[f'{prefix}head/bias'].shape[-1]:
         model.head.weight.copy_(_n2p(w[f'{prefix}head/kernel']))
         model.head.bias.copy_(_n2p(w[f'{prefix}head/bias']))
     # NOTE representation layer has been removed, not used in latest 21k/1k pretrained weights
     # if isinstance(getattr(model.pre_logits, 'fc', None), nn.Linear) and f'{prefix}pre_logits/bias' in w:
     #     model.pre_logits.fc.weight.copy_(_n2p(w[f'{prefix}pre_logits/kernel']))
     #     model.pre_logits.fc.bias.copy_(_n2p(w[f'{prefix}pre_logits/bias']))
-    if model.attn_pool is not None:
-        block_prefix = f'{prefix}MAPHead_0/'
-        mha_prefix = block_prefix + f'MultiHeadDotProductAttention_0/'
-        model.attn_pool.latent.copy_(_n2p(w[f'{block_prefix}probe'], t=False))
-        model.attn_pool.kv.weight.copy_(torch.cat([
-            _n2p(w[f'{mha_prefix}{n}/kernel'], t=False).flatten(1).T for n in ('key', 'value')]))
-        model.attn_pool.kv.bias.copy_(torch.cat([
-            _n2p(w[f'{mha_prefix}{n}/bias'], t=False).reshape(-1) for n in ('key', 'value')]))
-        model.attn_pool.q.weight.copy_(_n2p(w[f'{mha_prefix}query/kernel'], t=False).flatten(1).T)
-        model.attn_pool.q.bias.copy_(_n2p(w[f'{mha_prefix}query/bias'], t=False).reshape(-1))
-        model.attn_pool.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
-        model.attn_pool.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
-        model.attn_pool.norm.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/scale']))
-        model.attn_pool.norm.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/bias']))
-        for r in range(2):
-            getattr(model.attn_pool.mlp, f'fc{r + 1}').weight.copy_(_n2p(w[f'{block_prefix}MlpBlock_0/Dense_{r}/kernel']))
-            getattr(model.attn_pool.mlp, f'fc{r + 1}').bias.copy_(_n2p(w[f'{block_prefix}MlpBlock_0/Dense_{r}/bias']))
-
     mha_sub, b_sub, ln1_sub = (0, 0, 1) if big_vision else (1, 3, 2)
     for i, block in enumerate(model.blocks.children()):
-        if f'{prefix}Transformer/encoderblock/LayerNorm_0/scale' in w:
-            block_prefix = f'{prefix}Transformer/encoderblock/'
-            idx = i
-        else:
-            block_prefix = f'{prefix}Transformer/encoderblock_{i}/'
-            idx = None
+        block_prefix = f'{prefix}Transformer/encoderblock_{i}/'
         mha_prefix = block_prefix + f'MultiHeadDotProductAttention_{mha_sub}/'
-        block.norm1.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/scale'], idx=idx))
-        block.norm1.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/bias'], idx=idx))
+        block.norm1.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/scale']))
+        block.norm1.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/bias']))
         block.attn.qkv.weight.copy_(torch.cat([
-            _n2p(w[f'{mha_prefix}{n}/kernel'], t=False, idx=idx).flatten(1).T for n in ('query', 'key', 'value')]))
+            _n2p(w[f'{mha_prefix}{n}/kernel'], t=False).flatten(1).T for n in ('query', 'key', 'value')]))
         block.attn.qkv.bias.copy_(torch.cat([
-            _n2p(w[f'{mha_prefix}{n}/bias'], t=False, idx=idx).reshape(-1) for n in ('query', 'key', 'value')]))
-        block.attn.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel'], idx=idx).flatten(1))
-        block.attn.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias'], idx=idx))
-        block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_{ln1_sub}/scale'], idx=idx))
-        block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_{ln1_sub}/bias'], idx=idx))
+            _n2p(w[f'{mha_prefix}{n}/bias'], t=False).reshape(-1) for n in ('query', 'key', 'value')]))
+        block.attn.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
+        block.attn.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
         for r in range(2):
-            getattr(block.mlp, f'fc{r + 1}').weight.copy_(
-                _n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/kernel'], idx=idx))
-            getattr(block.mlp, f'fc{r + 1}').bias.copy_(
-                _n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/bias'], idx=idx))
+            getattr(block.mlp, f'fc{r + 1}').weight.copy_(_n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/kernel']))
+            getattr(block.mlp, f'fc{r + 1}').bias.copy_(_n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/bias']))
+        block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_{ln1_sub}/scale']))
+        block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_{ln1_sub}/bias']))
 
 
-def _convert_openai_clip(
-        state_dict: Dict[str, torch.Tensor],
-        model: VisionTransformer,
-        prefix: str = 'visual.',
-) -> Dict[str, torch.Tensor]:
+def _convert_openai_clip(state_dict, model):
     out_dict = {}
     swaps = [
-        ('conv1', 'patch_embed.proj'),
-        ('positional_embedding', 'pos_embed'),
-        ('transformer.resblocks.', 'blocks.'),
-        ('ln_pre', 'norm_pre'),
-        ('ln_post', 'norm'),
-        ('ln_', 'norm'),
-        ('in_proj_', 'qkv.'),
-        ('out_proj', 'proj'),
-        ('mlp.c_fc', 'mlp.fc1'),
-        ('mlp.c_proj', 'mlp.fc2'),
+        ('visual.', ''), ('conv1', 'patch_embed.proj'), ('positional_embedding', 'pos_embed'),
+        ('transformer.resblocks.', 'blocks.'), ('ln_pre', 'norm_pre'), ('ln_post', 'norm'), ('ln_', 'norm'),
+        ('in_proj_', 'qkv.'), ('out_proj', 'proj'), ('mlp.c_fc', 'mlp.fc1'), ('mlp.c_proj', 'mlp.fc2'),
     ]
     for k, v in state_dict.items():
-        if not k.startswith(prefix):
+        if not k.startswith('visual.'):
             continue
-        k = k.replace(prefix, '')
         for sp in swaps:
             k = k.replace(sp[0], sp[1])
 
@@ -1191,88 +1037,33 @@ def _convert_openai_clip(
             v = v.unsqueeze(0).unsqueeze(1)
         elif k == 'pos_embed':
             v = v.unsqueeze(0)
-        out_dict[k] = v
-    return out_dict
-
-
-def _convert_dinov2(
-        state_dict: Dict[str, torch.Tensor],
-        model: VisionTransformer,
-) -> Dict[str, torch.Tensor]:
-    import re
-    out_dict = {}
-    state_dict.pop("mask_token", None)
-    if 'register_tokens' in state_dict:
-        # convert dinov2 w/ registers to no_embed_class timm model (neither cls or reg tokens overlap pos embed)
-        out_dict['reg_token'] = state_dict.pop('register_tokens')
-        out_dict['cls_token'] = state_dict.pop('cls_token') + state_dict['pos_embed'][:, 0]
-        out_dict['pos_embed'] = state_dict.pop('pos_embed')[:, 1:]
-    for k, v in state_dict.items():
-        if re.match(r"blocks\.(\d+)\.mlp\.w12\.(?:weight|bias)", k):
-            out_dict[k.replace("w12", "fc1")] = v
-            continue
-        elif re.match(r"blocks\.(\d+)\.mlp\.w3\.(?:weight|bias)", k):
-            out_dict[k.replace("w3", "fc2")] = v
-            continue
-        out_dict[k] = v
-    return out_dict
-
-
-def _convert_aimv2(
-        state_dict: Dict[str, torch.Tensor],
-        model: VisionTransformer,
-) -> Dict[str, torch.Tensor]:
-    out_dict = {}
-    for k, v in state_dict.items():
-        k = k.replace('norm_1', 'norm1')
-        k = k.replace('norm_2', 'norm2')
-        k = k.replace('preprocessor.patchifier.', 'patch_embed.')
-        k = k.replace('preprocessor.pos_embed', 'pos_embed')
-        k = k.replace('trunk.', '')
-        k = k.replace('post_trunk_norm.', 'norm.')
-        k = k.replace('mlp.fc1', 'mlp.fc1_g')
-        k = k.replace('mlp.fc3', 'mlp.fc1_x')
+            if v.shape[1] != model.pos_embed.shape[1]:
+                # To resize pos embedding when using model at different size from pretrained weights
+                v = resize_pos_embed(
+                    v,
+                    model.pos_embed,
+                    0 if getattr(model, 'no_embed_class') else getattr(model, 'num_prefix_tokens', 1),
+                    model.patch_embed.grid_size
+                )
         out_dict[k] = v
     return out_dict
 
 
 def checkpoint_filter_fn(
-        state_dict: Dict[str, torch.Tensor],
-        model: VisionTransformer,
-        adapt_layer_scale: bool = False,
-        interpolation: str = 'bicubic',
-        antialias: bool = True,
-) -> Dict[str, torch.Tensor]:
+        state_dict,
+        model,
+        adapt_layer_scale=False,
+        interpolation='bicubic',
+        antialias=True,
+):
     """ convert patch embedding weight from manual patchify + linear proj to conv"""
     import re
     out_dict = {}
     state_dict = state_dict.get('model', state_dict)
     state_dict = state_dict.get('state_dict', state_dict)
-    prefix = ''
 
     if 'visual.class_embedding' in state_dict:
-        state_dict = _convert_openai_clip(state_dict, model)
-    elif 'module.visual.class_embedding' in state_dict:
-        state_dict = _convert_openai_clip(state_dict, model, prefix='module.visual.')
-    elif "mask_token" in state_dict:
-        state_dict = _convert_dinov2(state_dict, model)
-    elif "encoder" in state_dict:
-        # IJEPA, vit in an 'encoder' submodule
-        state_dict = state_dict['encoder']
-        prefix = 'module.'
-    elif 'visual.trunk.pos_embed' in state_dict or 'visual.trunk.blocks.0.norm1.weight' in state_dict:
-        # OpenCLIP model with timm vision encoder
-        prefix = 'visual.trunk.'
-        if 'visual.head.proj.weight' in state_dict and isinstance(model.head, nn.Linear):
-            # remap final nn.Linear if it exists outside of the timm .trunk (ie in visual.head.proj)
-            out_dict['head.weight'] = state_dict['visual.head.proj.weight']
-            out_dict['head.bias'] = torch.zeros(state_dict['visual.head.proj.weight'].shape[0])
-    elif 'preprocessor.patchifier.proj.weight' in state_dict:
-        state_dict = _convert_aimv2(state_dict, model)
-
-    if prefix:
-        # filter on & remove prefix string from keys
-        state_dict = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+        return _convert_openai_clip(state_dict, model)
 
     for k, v in state_dict.items():
         if 'patch_embed.proj.weight' in k:
@@ -1310,23 +1101,18 @@ def checkpoint_filter_fn(
     return out_dict
 
 
-def _cfg(url: str = '', **kwargs) -> Dict[str, Any]:
+def _cfg(url='', **kwargs):
     return {
         'url': url,
-        'num_classes': 1000,
-        'input_size': (3, 224, 224),
-        'pool_size': None,
-        'crop_pct': 0.9,
-        'interpolation': 'bicubic',
-        'fixed_input_size': True,
-        'mean': IMAGENET_INCEPTION_MEAN,
-        'std': IMAGENET_INCEPTION_STD,
-        'first_conv': 'patch_embed.proj',
-        'classifier': 'head',
-        **kwargs,
+        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None,
+        'crop_pct': .9, 'interpolation': 'bicubic', 'fixed_input_size': True,
+        'mean': IMAGENET_INCEPTION_MEAN, 'std': IMAGENET_INCEPTION_STD,
+        'first_conv': 'patch_embed.proj', 'classifier': 'head',
+        **kwargs
     }
 
-default_cfgs = {
+
+default_cfgs = generate_default_cfgs({
 
     # re-finetuned augreg 21k FT on in1k weights
     'vit_base_patch16_224.augreg2_in21k_ft_in1k': _cfg(
@@ -1433,26 +1219,15 @@ default_cfgs = {
     'vit_giant_patch14_224.untrained': _cfg(url=''),
     'vit_gigantic_patch14_224.untrained': _cfg(url=''),
 
-    # patch models, imagenet21k (weights from official Google JAX impl), classifier not valid
-    'vit_base_patch32_224.orig_in21k': _cfg(
-        #url='https://github.com/huggingface/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_patch32_224_in21k-8db57226.pth',
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_base_patch16_224.orig_in21k': _cfg(
-        #url='https://github.com/huggingface/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_patch16_224_in21k-e5005f0a.pth',
-        hf_hub_id='timm/',
-        num_classes=0),
+    # patch models, imagenet21k (weights from official Google JAX impl)
     'vit_large_patch32_224.orig_in21k': _cfg(
-        #url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_large_patch32_224_in21k-9046d2e7.pth',
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_large_patch32_224_in21k-9046d2e7.pth',
         hf_hub_id='timm/',
-        num_classes=0),
-    'vit_large_patch16_224.orig_in21k': _cfg(
-        #url='https://github.com/huggingface/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_large_patch16_224_in21k-606da67d.pth',
-        hf_hub_id='timm/',
-        num_classes=0),
+        num_classes=21843),
     'vit_huge_patch14_224.orig_in21k': _cfg(
+        url='https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz',
         hf_hub_id='timm/',
-        num_classes=0),
+        custom_load=True, num_classes=21843),
 
     # How to train your ViT (augreg) weights, pretrained on in21k
     'vit_tiny_patch16_224.augreg_in21k': _cfg(
@@ -1510,58 +1285,6 @@ default_cfgs = {
         hf_hub_id='timm/',
         mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
 
-    # DINOv2 pretrained - https://arxiv.org/abs/2304.07193 (no classifier head, for fine-tune/features only)
-    'vit_small_patch14_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-    'vit_base_patch14_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-    'vit_large_patch14_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-    'vit_giant_patch14_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-
-    # DINOv2 pretrained w/ registers - https://arxiv.org/abs/2309.16588 (no classifier head, for fine-tune/features only)
-    'vit_small_patch14_reg4_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-    'vit_base_patch14_reg4_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-    'vit_large_patch14_reg4_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_reg4_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-    'vit_giant_patch14_reg4_dinov2.lvd142m': _cfg(
-        url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_reg4_pretrain.pth',
-        hf_hub_id='timm/',
-        license='apache-2.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0,
-        input_size=(3, 518, 518), crop_pct=1.0),
-
     # ViT ImageNet-21K-P pretraining by MILL
     'vit_base_patch16_224_miil.in21k': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/vit_base_patch16_224_in21k_miil-887286df.pth',
@@ -1573,16 +1296,16 @@ default_cfgs = {
         mean=(0., 0., 0.), std=(1., 1., 1.), crop_pct=0.875, interpolation='bilinear'),
 
     # Custom timm variants
-    'vit_base_patch16_rpn_224.sw_in1k': _cfg(
+    'vit_base_patch16_rpn_224.in1k': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tpu-weights/vit_base_patch16_rpn_224-sw-3b07e89d.pth',
         hf_hub_id='timm/'),
-    'vit_medium_patch16_gap_240.sw_in12k': _cfg(
+    'vit_medium_patch16_gap_240.in12k': _cfg(
         hf_hub_id='timm/',
         input_size=(3, 240, 240), crop_pct=0.95, num_classes=11821),
-    'vit_medium_patch16_gap_256.sw_in12k_ft_in1k': _cfg(
+    'vit_medium_patch16_gap_256.in12k_ft_in1k': _cfg(
         hf_hub_id='timm/',
         input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_medium_patch16_gap_384.sw_in12k_ft_in1k': _cfg(
+    'vit_medium_patch16_gap_384.in12k_ft_in1k': _cfg(
         hf_hub_id='timm/',
         input_size=(3, 384, 384), crop_pct=0.95, crop_mode='squash'),
     'vit_base_patch16_gap_224': _cfg(),
@@ -1680,6 +1403,9 @@ default_cfgs = {
         hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0),
 
+    'vit_base_patch32_clip_224.laion2b_ft_in12k': _cfg(
+        #hf_hub_id='timm/vit_base_patch32_clip_224.laion2b_ft_in12k',  # FIXME weight exists, need to push
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821),
     'vit_base_patch16_clip_224.laion2b_ft_in12k': _cfg(
         hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821),
@@ -1690,6 +1416,9 @@ default_cfgs = {
         hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=11821),
 
+    'vit_base_patch32_clip_224.openai_ft_in12k': _cfg(
+        # hf_hub_id='timm/vit_base_patch32_clip_224.openai_ft_in12k',  # FIXME weight exists, need to push
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821),
     'vit_base_patch16_clip_224.openai_ft_in12k': _cfg(
         hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821),
@@ -1698,147 +1427,50 @@ default_cfgs = {
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=11821),
 
     'vit_base_patch32_clip_224.laion2b': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='laion/CLIP-ViT-B-32-laion2B-s34B-b79K',
+        hf_hub_filename='open_clip_pytorch_model.bin',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
     'vit_base_patch16_clip_224.laion2b': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='laion/CLIP-ViT-B-16-laion2B-s34B-b88K',
+        hf_hub_filename='open_clip_pytorch_model.bin',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
     'vit_large_patch14_clip_224.laion2b': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='laion/CLIP-ViT-L-14-laion2B-s32B-b82K',
+        hf_hub_filename='open_clip_pytorch_model.bin',
         mean=IMAGENET_INCEPTION_MEAN, std=IMAGENET_INCEPTION_STD, crop_pct=1.0, num_classes=768),
     'vit_huge_patch14_clip_224.laion2b': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='laion/CLIP-ViT-H-14-laion2B-s32B-b79K',
+        hf_hub_filename='open_clip_pytorch_model.bin',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=1024),
     'vit_giant_patch14_clip_224.laion2b': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='laion/CLIP-ViT-g-14-laion2B-s12B-b42K',
+        hf_hub_filename='open_clip_pytorch_model.bin',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=1024),
     'vit_gigantic_patch14_clip_224.laion2b': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='laion/CLIP-ViT-bigG-14-laion2B-39B-b160k',
+        hf_hub_filename='open_clip_pytorch_model.bin',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=1280),
-
-    'vit_base_patch32_clip_224.laion400m_e32': _cfg(
-        hf_hub_id='timm/',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
-    'vit_base_patch16_clip_224.laion400m_e32': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_base_patch16_plus_clip_240.laion400m_e32': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 240, 240), crop_pct=1.0, num_classes=640),
-    'vit_large_patch14_clip_224.laion400m_e32': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=768),
-
-    'vit_base_patch32_clip_224.datacompxl': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_base_patch32_clip_256.datacompxl': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        crop_pct=1.0, input_size=(3, 256, 256), num_classes=512),
-    'vit_base_patch16_clip_224.datacompxl': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_large_patch14_clip_224.datacompxl': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=768),
-
-    'vit_base_patch16_clip_224.dfn2b': _cfg(
-        hf_hub_id='timm/',
-        license='apple-ascl',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_large_patch14_clip_224.dfn2b_s39b': _cfg(
-        hf_hub_id='timm/',
-        license='apple-ascl',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=768),
-    'vit_large_patch14_clip_224.dfn2b': _cfg(
-        hf_hub_id='timm/',
-        license='apple-ascl',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=768),
-    'vit_huge_patch14_clip_224.dfn5b': _cfg(
-        hf_hub_id='timm/',
-        license='apple-ascl',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=1024),
-    'vit_huge_patch14_clip_378.dfn5b': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        license='apple-ascl',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        crop_pct=1.0, input_size=(3, 378, 378), num_classes=1024),
-
-    'vit_base_patch32_clip_224.metaclip_2pt5b': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_base_patch16_clip_224.metaclip_2pt5b': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_large_patch14_clip_224.metaclip_2pt5b': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=768),
-    'vit_huge_patch14_clip_224.metaclip_2pt5b': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=1024),
-    'vit_huge_patch14_clip_224.metaclip_altogether': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=1024),
-    'vit_gigantic_patch14_clip_224.metaclip_2pt5b': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=1280),
-    'vit_base_patch32_clip_224.metaclip_400m': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_base_patch16_clip_224.metaclip_400m': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=512),
-    'vit_large_patch14_clip_224.metaclip_400m': _cfg(
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=768),
 
     'vit_base_patch32_clip_224.openai': _cfg(
         hf_hub_id='timm/',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
     'vit_base_patch16_clip_224.openai': _cfg(
         hf_hub_id='timm/',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
     'vit_large_patch14_clip_224.openai': _cfg(
         hf_hub_id='timm/',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, crop_pct=1.0, num_classes=768),
     'vit_large_patch14_clip_336.openai': _cfg(
-        hf_hub_id='timm/',
-        notes=('natively QuickGELU, use quickgelu model variant for original results',),
+        hf_hub_id='timm/', hf_hub_filename='open_clip_pytorch_model.bin',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         crop_pct=1.0, input_size=(3, 336, 336), num_classes=768),
 
     # experimental (may be removed)
-    'vit_base_patch32_plus_256.untrained': _cfg(url='', input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_base_patch16_plus_240.untrained': _cfg(url='', input_size=(3, 240, 240), crop_pct=0.95),
-    'vit_small_patch16_36x1_224.untrained': _cfg(url=''),
-    'vit_small_patch16_18x2_224.untrained': _cfg(url=''),
-    'vit_base_patch16_18x2_224.untrained': _cfg(url=''),
+    'vit_base_patch32_plus_256': _cfg(url='', input_size=(3, 256, 256), crop_pct=0.95),
+    'vit_base_patch16_plus_240': _cfg(url='', input_size=(3, 240, 240), crop_pct=0.95),
+    'vit_small_patch16_36x1_224': _cfg(url=''),
+    'vit_small_patch16_18x2_224': _cfg(url=''),
+    'vit_base_patch16_18x2_224': _cfg(url=''),
 
     # EVA fine-tuned weights from MAE style MIM - EVA-CLIP target pretrain
     # https://github.com/baaivision/EVA/blob/7ecf2c0a370d97967e86d047d7af9188f78d2df3/eva/README.md#eva-l-learning-better-mim-representations-from-eva-clip
@@ -1922,413 +1554,13 @@ default_cfgs = {
     'vit_base_patch16_xp_224.untrained': _cfg(url=''),
     'vit_large_patch14_xp_224.untrained': _cfg(url=''),
     'vit_huge_patch14_xp_224.untrained': _cfg(url=''),
-
-    'vit_base_patch16_224.mae': _cfg(
-        url='https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_base.pth',
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
-    'vit_large_patch16_224.mae': _cfg(
-        url='https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_large.pth',
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
-    'vit_huge_patch14_224.mae': _cfg(
-        url='https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_huge.pth',
-        hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
-
-    'vit_huge_patch14_gap_224.in1k_ijepa': _cfg(
-        url='https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.14-300e.pth.tar',
-        # hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
-    'vit_huge_patch14_gap_224.in22k_ijepa': _cfg(
-        url='https://dl.fbaipublicfiles.com/ijepa/IN22K-vit.h.14-900e.pth.tar',
-        # hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
-    'vit_huge_patch16_gap_448.in1k_ijepa': _cfg(
-        url='https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.16-448px-300e.pth.tar',
-        # hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
-    'vit_giant_patch16_gap_224.in22k_ijepa': _cfg(
-        url='https://dl.fbaipublicfiles.com/ijepa/IN22K-vit.g.16-600e.pth.tar',
-        # hf_hub_id='timm/',
-        license='cc-by-nc-4.0',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, num_classes=0),
-
-    'vit_base_patch16_siglip_224.webli': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_base_patch16_siglip_256.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_base_patch16_siglip_256.webli_i18n': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_base_patch16_siglip_384.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384),
-        num_classes=0),
-    'vit_base_patch16_siglip_512.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 512, 512),
-        num_classes=0),
-    'vit_large_patch16_siglip_256.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_large_patch16_siglip_384.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384),
-        num_classes=0),
-    'vit_so400m_patch14_siglip_224.webli': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_so400m_patch16_siglip_256.webli_i18n': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_so400m_patch14_siglip_378.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 378, 378),
-        num_classes=0),
-    'vit_so400m_patch14_siglip_384.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384),
-        num_classes=0),
-
-    'vit_base_patch16_siglip_gap_224.webli': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_base_patch16_siglip_gap_256.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_base_patch16_siglip_gap_256.webli_i18n': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_base_patch16_siglip_gap_384.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384),
-        num_classes=0),
-    'vit_base_patch16_siglip_gap_512.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 512, 512),
-        num_classes=0),
-    'vit_large_patch16_siglip_gap_256.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_large_patch16_siglip_gap_384.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384),
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_224.webli': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_224.pali_mix': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_224.pali_pt': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_224.pali2_3b_pt': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_224.pali2_10b_pt': _cfg(
-        hf_hub_id='timm/',
-        num_classes=0),
-    # 'vit_so400m_patch14_siglip_gap_224.pali2_28b_pt': _cfg(
-    #     hf_hub_id='google/paligemma2-28b-pt-224-jax',
-    #     hf_hub_filename='pt_27b_224.npz',
-    #     custom_load='hf',
-    #     num_classes=0),
-    'vit_so400m_patch16_siglip_gap_256.webli_i18n': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256),
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_378.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 378, 378), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_384.webli': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali_mix': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali_pt': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali_refcoco_seg': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali_ocrvqa': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali2_3b_pt': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali2_10b_pt': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    # 'vit_so400m_patch14_siglip_gap_448.pali2_28b_pt': _cfg(
-    #     hf_hub_id='google/paligemma2-28b-pt-448-jax',
-    #     hf_hub_filename='pt_27b_448.npz',
-    #     custom_load='hf',
-    #     input_size=(3, 448, 448), crop_pct=1.0,
-    #     num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali2_3b_docci': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_448.pali2_10b_docci': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 448, 448), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_896.pali_pt': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 896, 896), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_896.pali_refcoco_seg': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 896, 896), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_896.pali_ocrvqa': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 896, 896), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_896.pali2_3b_pt': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 896, 896), crop_pct=1.0,
-        num_classes=0),
-    'vit_so400m_patch14_siglip_gap_896.pali2_10b_pt': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 896, 896), crop_pct=1.0,
-        num_classes=0),
-    # 'vit_so400m_patch14_siglip_gap_896.pali2_28b_pt': _cfg(
-    #     hf_hub_id='google/paligemma2-28b-pt-896-jax',
-    #     hf_hub_filename='pt_27b_896.npz',
-    #     custom_load='hf',
-    #     input_size=(3, 896, 896), crop_pct=1.0,
-    #     num_classes=0),
-
-    'vit_so400m_patch14_siglip_378.webli_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 378, 378), crop_pct=1.0, crop_mode='squash',
-    ),
-    'vit_so400m_patch14_siglip_gap_378.webli_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 378, 378), crop_pct=1.0, crop_mode='squash',
-    ),
-
-    'vit_xsmall_patch16_clip_224.tinyclip_yfcc15m': _cfg(
-        hf_hub_id='timm/',
-        license='mit',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
-    'vit_medium_patch32_clip_224.tinyclip_laion400m': _cfg(
-        hf_hub_id='timm/',
-        license='mit',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
-    'vit_medium_patch16_clip_224.tinyclip_yfcc15m': _cfg(
-        hf_hub_id='timm/',
-        license='mit',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
-    'vit_betwixt_patch32_clip_224.tinyclip_laion400m': _cfg(
-        hf_hub_id='timm/',
-        license='mit',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=512),
-
-    'vit_wee_patch16_reg1_gap_256.sbb_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_pwee_patch16_reg1_gap_256.sbb_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_little_patch16_reg1_gap_256.sbb_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_little_patch16_reg1_gap_256.sbb_in12k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=11821,
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_little_patch16_reg4_gap_256.sbb_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_medium_patch16_reg1_gap_256.sbb_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_medium_patch16_reg4_gap_256.sbb_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_medium_patch16_reg4_gap_256.sbb_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_medium_patch16_reg4_gap_256.sbb_in12k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=11821,
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_mediumd_patch16_reg4_gap_256.sbb2_e200_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_mediumd_patch16_reg4_gap_256.sbb_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_mediumd_patch16_reg4_gap_256.sbb2_e200_in12k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=11821,
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_mediumd_patch16_reg4_gap_256.sbb_in12k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=11821,
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_mediumd_patch16_reg4_gap_384.sbb2_e200_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), crop_pct=1.0),
-    'vit_betwixt_patch16_reg1_gap_256.sbb_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_betwixt_patch16_reg4_gap_256.sbb2_e200_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_betwixt_patch16_reg4_gap_256.sbb_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_betwixt_patch16_reg4_gap_256.sbb_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_betwixt_patch16_reg4_gap_256.sbb2_e200_in12k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=11821,
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_betwixt_patch16_reg4_gap_256.sbb_in12k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=11821,
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_betwixt_patch16_reg4_gap_384.sbb2_e200_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), crop_pct=1.0),
-    'vit_base_patch16_reg4_gap_256.untrained': _cfg(
-        input_size=(3, 256, 256)),
-
-    'vit_so150m_patch16_reg4_gap_256.sbb_e250_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_so150m_patch16_reg4_gap_256.sbb_e250_in12k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=11821,
-        input_size=(3, 256, 256), crop_pct=0.95),
-    'vit_so150m_patch16_reg4_gap_384.sbb_e250_in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), crop_pct=1.0),
-    'vit_so150m_patch16_reg4_map_256.untrained': _cfg(
-        input_size=(3, 256, 256)),
-    'vit_so150m2_patch16_reg1_gap_256.untrained': _cfg(
-        input_size=(3, 256, 256), crop_pct=0.95),
-
-    'vit_intern300m_patch14_448.ogvl_dist': _cfg(
-        hf_hub_id='timm/',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD,
-        input_size=(3, 448, 448), crop_pct=1.0, num_classes=0,
-    ),
-
-    'aimv2_large_patch14_224.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        crop_pct=1.0, num_classes=0),
-    'aimv2_large_patch14_224.apple_pt_dist': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        crop_pct=1.0, num_classes=0),
-    'aimv2_huge_patch14_224.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        crop_pct=1.0, num_classes=0),
-    'aimv2_1b_patch14_224.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        crop_pct=1.0, num_classes=0),
-    'aimv2_3b_patch14_224.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        crop_pct=1.0, num_classes=0),
-    'aimv2_large_patch14_336.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 336, 336), crop_pct=1.0, num_classes=0),
-    'aimv2_large_patch14_336.apple_pt_dist': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 336, 336), crop_pct=1.0, num_classes=0),
-    'aimv2_huge_patch14_336.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 336, 336), crop_pct=1.0, num_classes=0),
-    'aimv2_1b_patch14_336.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 336, 336), crop_pct=1.0, num_classes=0),
-    'aimv2_3b_patch14_336.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 336, 336), crop_pct=1.0, num_classes=0),
-    'aimv2_large_patch14_448.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 448, 448), crop_pct=1.0, num_classes=0),
-    'aimv2_huge_patch14_448.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 448, 448), crop_pct=1.0, num_classes=0),
-    'aimv2_1b_patch14_448.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 448, 448), crop_pct=1.0, num_classes=0),
-    'aimv2_3b_patch14_448.apple_pt': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, license='apple-ascl',
-        input_size=(3, 448, 448), crop_pct=1.0, num_classes=0),
-
-    'test_vit.r160_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 160, 160), crop_pct=0.95),
-    'test_vit2.r160_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 160, 160), crop_pct=0.95),
-    'test_vit3.r160_in1k': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 160, 160), crop_pct=0.95),
-    'test_vit4.r160_in1k': _cfg(
-        input_size=(3, 160, 160), crop_pct=0.95),
-}
-
-_quick_gelu_cfgs = [n for n, c in default_cfgs.items() if c.get('notes', ()) and 'quickgelu' in c['notes'][0]]
-for n in _quick_gelu_cfgs:
-    # generate quickgelu default cfgs based on contents of notes field
-    c = copy.deepcopy(default_cfgs[n])
-    if c['hf_hub_id'] == 'timm/':
-        c['hf_hub_id'] = 'timm/' + n  # need to use non-quickgelu model name for hub id
-    default_cfgs[n.replace('_clip_', '_clip_quickgelu_')] = c
-default_cfgs = generate_default_cfgs(default_cfgs)
+})
 
 
-def _create_vision_transformer(variant: str, pretrained: bool = False, **kwargs) -> VisionTransformer:
-    out_indices = kwargs.pop('out_indices', 3)
+def _create_vision_transformer(variant, pretrained=False, **kwargs):
+    if kwargs.get('features_only', None):
+        raise RuntimeError('features_only not implemented for Vision Transformer models.')
+
     if 'flexi' in variant:
         # FIXME Google FlexiViT pretrained models have a strong preference for bilinear patch / embed
         # interpolation, other pretrained models resize better w/ anti-aliased bicubic interpolation.
@@ -2336,24 +1568,255 @@ def _create_vision_transformer(variant: str, pretrained: bool = False, **kwargs)
     else:
         _filter_fn = checkpoint_filter_fn
 
-    # FIXME attn pool (currently only in siglip) params removed if pool disabled, is there a better soln?
-    strict = kwargs.pop('pretrained_strict', True)
-    if 'siglip' in variant and kwargs.get('global_pool', None) != 'map':
-        strict = False
-
     return build_model_with_cfg(
-        VisionTransformer,
-        variant,
-        pretrained,
+        VisionTransformer, variant, pretrained,
         pretrained_filter_fn=_filter_fn,
-        pretrained_strict=strict,
-        feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
         **kwargs,
     )
 
+@register_model
+def vit_embed_dim120_patch16_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=120, depth=24, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
 
 @register_model
-def vit_tiny_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_embed_dim288_patch16_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=288, depth=24, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_layer_scale_embed_dim120_patch16_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=120, depth=24, num_heads=3, init_values=1e-5 )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_learnable_scaler_embed_dim120_patch16_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=120, depth=24, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim288_patch32_head3_depth36(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=288, depth=36, num_heads=3  )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim288_patch32_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=288, depth=24, num_heads=3  )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
+@register_model
+def vit_learnable_scaler_embed_dim288_patch32_head3_depth36(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=288, depth=36, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
+@register_model
+def vit_learnable_scaler_embed_dim288_patch32_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=288, depth=24, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_learnable_scaler_embed_dim384_patch32_head6_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=24, num_heads=6, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
+@register_model
+def vit_learnable_scaler_embed_dim384_patch32_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=24, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_learnable_scaler_embed_dim384_patch32_head3_depth12(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_learnable_scaler_embed_dim192_patch16_head3_depth12(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_learnable_scaler_embed_dim192_patch16_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=192, depth=24, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_learnable_scaler_embed_dim288_patch16_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=288, depth=24, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
+@register_model
+def vit_learnable_scaler_embed_dim192_patch16_head3_depth36(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=192, depth=36, num_heads=3, norm_layer = LearnableScaler )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim198_patch16_head6_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=198, depth=24, num_heads=6)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim384_patch32_head3_224(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_embed_dim192_patch16_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=192, depth=24, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_layer_scale_embed_dim192_patch16_head3_depth24_224(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=192, depth=24, num_heads=3, init_values=1e-5 )
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim384_patch28_head3_224(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=28, embed_dim=384, depth=12, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim384_patch16_head3_224(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=384, depth=12, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim384_patch32_head3_depth24_224(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=24, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_embed_dim384_patch32_head3_depth12(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
+@register_model
+def vit_layer_scale_embed_dim384_patch32_head3_depth24_224(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=24, num_heads=3, init_values=1e-5)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_layer_scale_embed_dim288_patch32_head3_depth24(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=288, depth=24, num_heads=3, init_values=1e-5)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_layer_scale_embed_dim288_patch32_head3_depth36(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=32, embed_dim=288, depth=36, num_heads=3, init_values=1e-5)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_embed_dim198_patch16_head6_depth36(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(patch_size=16, embed_dim=198, depth=36, num_heads=6 )
+    model = _create_vision_transformer('vit_boosted_instance_norm_embed_dim198_patch16_head3_depth36_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
+@register_model
+def vit_tiny_patch16_224(pretrained=False, **kwargs):
     """ ViT-Tiny (Vit-Ti/16)
     """
     model_args = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3)
@@ -2362,7 +1825,16 @@ def vit_tiny_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_tiny_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_test(pretrained=False, **kwargs):
+    """ ViT-Tiny (Vit-Ti/16)
+    """
+    model_args = dict(img_size = 640, patch_size=16, embed_dim=192, depth=12, num_heads=3)
+    model = _create_vision_transformer('vit_tiny_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_tiny_patch16_384(pretrained=False, **kwargs):
     """ ViT-Tiny (Vit-Ti/16) @ 384x384.
     """
     model_args = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3)
@@ -2371,7 +1843,7 @@ def vit_tiny_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_small_patch32_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_small_patch32_224(pretrained=False, **kwargs):
     """ ViT-Small (ViT-S/32)
     """
     model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=6)
@@ -2380,7 +1852,7 @@ def vit_small_patch32_224(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_small_patch32_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_small_patch32_384(pretrained=False, **kwargs):
     """ ViT-Small (ViT-S/32) at 384x384.
     """
     model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=6)
@@ -2389,7 +1861,7 @@ def vit_small_patch32_384(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_small_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_small_patch16_224(pretrained=False, **kwargs):
     """ ViT-Small (ViT-S/16)
     """
     model_args = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6)
@@ -2398,7 +1870,7 @@ def vit_small_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_small_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_small_patch16_384(pretrained=False, **kwargs):
     """ ViT-Small (ViT-S/16)
     """
     model_args = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6)
@@ -2407,7 +1879,7 @@ def vit_small_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_small_patch8_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_small_patch8_224(pretrained=False, **kwargs):
     """ ViT-Small (ViT-S/8)
     """
     model_args = dict(patch_size=8, embed_dim=384, depth=12, num_heads=6)
@@ -2416,7 +1888,7 @@ def vit_small_patch8_224(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_base_patch32_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch32_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k, source https://github.com/google-research/vision_transformer.
     """
@@ -2426,7 +1898,7 @@ def vit_base_patch32_224(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_base_patch32_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch32_384(pretrained=False, **kwargs):
     """ ViT-Base model (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 384x384, source https://github.com/google-research/vision_transformer.
     """
@@ -2436,7 +1908,7 @@ def vit_base_patch32_384(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_base_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
     """
@@ -2446,7 +1918,7 @@ def vit_base_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_base_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_384(pretrained=False, **kwargs):
     """ ViT-Base model (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 384x384, source https://github.com/google-research/vision_transformer.
     """
@@ -2456,7 +1928,7 @@ def vit_base_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_base_patch8_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch8_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/8) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
     """
@@ -2466,7 +1938,7 @@ def vit_base_patch8_224(pretrained: bool = False, **kwargs) -> VisionTransformer
 
 
 @register_model
-def vit_large_patch32_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch32_224(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/32) from original paper (https://arxiv.org/abs/2010.11929). No pretrained weights.
     """
     model_args = dict(patch_size=32, embed_dim=1024, depth=24, num_heads=16)
@@ -2475,7 +1947,7 @@ def vit_large_patch32_224(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_large_patch32_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch32_384(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/32) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 384x384, source https://github.com/google-research/vision_transformer.
     """
@@ -2485,7 +1957,7 @@ def vit_large_patch32_384(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_large_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch16_224(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/16) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
     """
@@ -2495,7 +1967,7 @@ def vit_large_patch16_224(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_large_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch16_384(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/16) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 384x384, source https://github.com/google-research/vision_transformer.
     """
@@ -2505,7 +1977,7 @@ def vit_large_patch16_384(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_large_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch14_224(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/14)
     """
     model_args = dict(patch_size=14, embed_dim=1024, depth=24, num_heads=16)
@@ -2514,7 +1986,7 @@ def vit_large_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_huge_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_huge_patch14_224(pretrained=False, **kwargs):
     """ ViT-Huge model (ViT-H/14) from original paper (https://arxiv.org/abs/2010.11929).
     """
     model_args = dict(patch_size=14, embed_dim=1280, depth=32, num_heads=16)
@@ -2523,7 +1995,7 @@ def vit_huge_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransforme
 
 
 @register_model
-def vit_giant_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_giant_patch14_224(pretrained=False, **kwargs):
     """ ViT-Giant (little-g) model (ViT-g/14) from `Scaling Vision Transformers` - https://arxiv.org/abs/2106.04560
     """
     model_args = dict(patch_size=14, embed_dim=1408, mlp_ratio=48/11, depth=40, num_heads=16)
@@ -2532,7 +2004,7 @@ def vit_giant_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def vit_gigantic_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_gigantic_patch14_224(pretrained=False, **kwargs):
     """ ViT-Gigantic (big-G) model (ViT-G/14) from `Scaling Vision Transformers` - https://arxiv.org/abs/2106.04560
     """
     model_args = dict(patch_size=14, embed_dim=1664, mlp_ratio=64/13, depth=48, num_heads=16)
@@ -2542,35 +2014,7 @@ def vit_gigantic_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransf
 
 
 @register_model
-def vit_learnable_scaler_embed_dim192_patch16_head3_depth24(pretrained=False, **kwargs):
-    """ ViT-Tiny (Vit-Ti/16)
-    """
-    model_args = dict(patch_size=16, embed_dim=192, depth=24, num_heads=3, norm_layer = LearnableScaler )
-    model = _create_vision_transformer('vit_learnable_scaler_embed_dim192_patch16_head3_depth24', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_learnable_scaler_embed_dim192_patch16_head3_depth36(pretrained=False, **kwargs):
-    """ ViT-Tiny (Vit-Ti/16)
-    """
-    model_args = dict(patch_size=16, embed_dim=192, depth=36, num_heads=3, norm_layer = LearnableScaler )
-    model = _create_vision_transformer('vit_learnable_scaler_embed_dim192_patch16_head3_depth36', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_learnable_scaler_embed_dim288_patch16_head3_depth24(pretrained=False, **kwargs):
-    """ ViT-Tiny (Vit-Ti/16)
-    """
-    model_args = dict(patch_size=16, embed_dim=288, depth=24, num_heads=3, norm_layer = LearnableScaler )
-    model = _create_vision_transformer('vit_learnable_scaler_embed_dim288_patch16_head3_depth24', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-
-@register_model
-def vit_base_patch16_224_miil(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_224_miil(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
     Weights taken from: https://github.com/Alibaba-MIIL/ImageNet21K
     """
@@ -2581,7 +2025,7 @@ def vit_base_patch16_224_miil(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_medium_patch16_gap_240(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_medium_patch16_gap_240(pretrained=False, **kwargs):
     """ ViT-Medium (ViT-M/16) w/o class token, w/ avg-pool @ 240x240
     """
     model_args = dict(
@@ -2593,7 +2037,7 @@ def vit_medium_patch16_gap_240(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_medium_patch16_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_medium_patch16_gap_256(pretrained=False, **kwargs):
     """ ViT-Medium (ViT-M/16) w/o class token, w/ avg-pool @ 256x256
     """
     model_args = dict(
@@ -2605,7 +2049,7 @@ def vit_medium_patch16_gap_256(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_medium_patch16_gap_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_medium_patch16_gap_384(pretrained=False, **kwargs):
     """ ViT-Medium (ViT-M/16) w/o class token, w/ avg-pool @ 384x384
     """
     model_args = dict(
@@ -2617,20 +2061,8 @@ def vit_medium_patch16_gap_384(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_betwixt_patch16_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Betwixt (ViT-b/16) w/o class token, w/ avg-pool @ 256x256
-    """
-    model_args = dict(
-        patch_size=16, embed_dim=640, depth=12, num_heads=10, class_token=False,
-        global_pool='avg', qkv_bias=False, init_values=1e-6, fc_norm=False)
-    model = _create_vision_transformer(
-        'vit_medium_patch16_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_gap_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Base (ViT-B/16) w/o class token, w/ avg-pool @ 224x224
+def vit_base_patch16_gap_224(pretrained=False, **kwargs):
+    """ ViT-Base (ViT-B/16) w/o class token, w/ avg-pool @ 256x256
     """
     model_args = dict(
         patch_size=16, embed_dim=768, depth=12, num_heads=16, class_token=False, global_pool='avg', fc_norm=False)
@@ -2640,79 +2072,7 @@ def vit_base_patch16_gap_224(pretrained: bool = False, **kwargs) -> VisionTransf
 
 
 @register_model
-def vit_huge_patch14_gap_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Huge model (ViT-H/14) w/ no class token, avg pool
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1280, depth=32, num_heads=16, class_token=False, global_pool='avg', fc_norm=False)
-    model = _create_vision_transformer(
-        'vit_huge_patch14_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_huge_patch16_gap_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Huge model (ViT-H/16) w/ no class token, avg pool @ 448x448
-    """
-    model_args = dict(
-        patch_size=16, embed_dim=1280, depth=32, num_heads=16, class_token=False, global_pool='avg', fc_norm=False)
-    model = _create_vision_transformer(
-        'vit_huge_patch16_gap_448', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_giant_patch16_gap_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Giant (little-gg) model (ViT-g/16) w/ no class token, avg pool
-    """
-    model_args = dict(
-        patch_size=16, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=48/11,
-        class_token=False, global_pool='avg', fc_norm=False)
-    model = _create_vision_transformer(
-        'vit_giant_patch16_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_xsmall_patch16_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    # TinyCLIP 8M
-    model_args = dict(embed_dim=256, depth=10, num_heads=4, pre_norm=True, norm_layer=nn.LayerNorm)
-    model = _create_vision_transformer(
-        'vit_xsmall_patch16_clip_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_medium_patch32_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    # TinyCLIP 40M
-    model_args = dict(
-        patch_size=32, embed_dim=512, depth=12, num_heads=8, pre_norm=True, norm_layer=nn.LayerNorm)
-    model = _create_vision_transformer(
-        'vit_medium_patch32_clip_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_medium_patch16_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    # TinyCLIP 39M
-    model_args = dict(embed_dim=512, depth=12, num_heads=8, pre_norm=True, norm_layer=nn.LayerNorm)
-    model = _create_vision_transformer(
-        'vit_medium_patch16_clip_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_betwixt_patch32_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    # TinyCLIP 61M
-    model_args = dict(
-        patch_size=32, embed_dim=640, depth=12, num_heads=10, pre_norm=True, norm_layer=nn.LayerNorm)
-    model = _create_vision_transformer(
-        'vit_betwixt_patch32_clip_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch32_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch32_clip_224(pretrained=False, **kwargs):
     """ ViT-B/32 CLIP image tower @ 224x224
     """
     model_args = dict(
@@ -2723,18 +2083,7 @@ def vit_base_patch32_clip_224(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_base_patch32_clip_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-B/32 CLIP image tower @ 256x256
-    """
-    model_args = dict(
-        patch_size=32, embed_dim=768, depth=12, num_heads=12, pre_norm=True, norm_layer=nn.LayerNorm)
-    model = _create_vision_transformer(
-        'vit_base_patch32_clip_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch32_clip_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch32_clip_384(pretrained=False, **kwargs):
     """ ViT-B/32 CLIP image tower @ 384x384
     """
     model_args = dict(
@@ -2745,7 +2094,7 @@ def vit_base_patch32_clip_384(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_base_patch32_clip_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch32_clip_448(pretrained=False, **kwargs):
     """ ViT-B/32 CLIP image tower @ 448x448
     """
     model_args = dict(
@@ -2756,7 +2105,7 @@ def vit_base_patch32_clip_448(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_base_patch16_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_clip_224(pretrained=False, **kwargs):
     """ ViT-B/16 CLIP image tower
     """
     model_args = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, pre_norm=True, norm_layer=nn.LayerNorm)
@@ -2766,7 +2115,7 @@ def vit_base_patch16_clip_224(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_base_patch16_clip_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_clip_384(pretrained=False, **kwargs):
     """ ViT-B/16 CLIP image tower @ 384x384
     """
     model_args = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, pre_norm=True, norm_layer=nn.LayerNorm)
@@ -2776,17 +2125,7 @@ def vit_base_patch16_clip_384(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_base_patch16_plus_clip_240(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Base (ViT-B/16+) CLIP image tower @ 240x240
-    """
-    model_args = dict(patch_size=16, embed_dim=896, depth=12, num_heads=14, pre_norm=True, norm_layer=nn.LayerNorm)
-    model = _create_vision_transformer(
-        'vit_base_patch16_plus_clip_240', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch14_clip_224(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/14) CLIP image tower
     """
     model_args = dict(patch_size=14, embed_dim=1024, depth=24, num_heads=16, pre_norm=True, norm_layer=nn.LayerNorm)
@@ -2796,7 +2135,7 @@ def vit_large_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_large_patch14_clip_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch14_clip_336(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/14) CLIP image tower @ 336x336
     """
     model_args = dict(patch_size=14, embed_dim=1024, depth=24, num_heads=16, pre_norm=True, norm_layer=nn.LayerNorm)
@@ -2806,7 +2145,7 @@ def vit_large_patch14_clip_336(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_huge_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_huge_patch14_clip_224(pretrained=False, **kwargs):
     """ ViT-Huge model (ViT-H/14) CLIP image tower.
     """
     model_args = dict(patch_size=14, embed_dim=1280, depth=32, num_heads=16, pre_norm=True, norm_layer=nn.LayerNorm)
@@ -2816,7 +2155,7 @@ def vit_huge_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_huge_patch14_clip_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_huge_patch14_clip_336(pretrained=False, **kwargs):
     """ ViT-Huge model (ViT-H/14) CLIP image tower @ 336x336
     """
     model_args = dict(patch_size=14, embed_dim=1280, depth=32, num_heads=16, pre_norm=True, norm_layer=nn.LayerNorm)
@@ -2826,17 +2165,7 @@ def vit_huge_patch14_clip_336(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_huge_patch14_clip_378(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Huge model (ViT-H/14) CLIP image tower @ 378x378
-    """
-    model_args = dict(patch_size=14, embed_dim=1280, depth=32, num_heads=16, pre_norm=True, norm_layer=nn.LayerNorm)
-    model = _create_vision_transformer(
-        'vit_huge_patch14_clip_378', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_giant_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_giant_patch14_clip_224(pretrained=False, **kwargs):
     """ ViT-Giant (little-g) model (ViT-g/14) from `Scaling Vision Transformers` - https://arxiv.org/abs/2106.04560
     Pretrained weights from CLIP image tower.
     """
@@ -2848,7 +2177,7 @@ def vit_giant_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_gigantic_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_gigantic_patch14_clip_224(pretrained=False, **kwargs):
     """ ViT-bigG model (ViT-G/14) from `Scaling Vision Transformers` - https://arxiv.org/abs/2106.04560
     Pretrained weights from CLIP image tower.
     """
@@ -2858,95 +2187,10 @@ def vit_gigantic_patch14_clip_224(pretrained: bool = False, **kwargs) -> VisionT
         'vit_gigantic_patch14_clip_224', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
-
-@register_model
-def vit_base_patch32_clip_quickgelu_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-B/32 CLIP image tower @ 224x224
-    """
-    model_args = dict(
-        patch_size=32, embed_dim=768, depth=12, num_heads=12, pre_norm=True,
-        norm_layer=nn.LayerNorm, act_layer='quick_gelu')
-    model = _create_vision_transformer(
-        'vit_base_patch32_clip_quickgelu_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_clip_quickgelu_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-B/16 CLIP image tower w/ QuickGELU act
-    """
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, pre_norm=True,
-        norm_layer=nn.LayerNorm, act_layer='quick_gelu')
-    model = _create_vision_transformer(
-        'vit_base_patch16_clip_quickgelu_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch14_clip_quickgelu_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Large model (ViT-L/14) CLIP image tower w/ QuickGELU act
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1024, depth=24, num_heads=16, pre_norm=True,
-        norm_layer=nn.LayerNorm, act_layer='quick_gelu')
-    model = _create_vision_transformer(
-        'vit_large_patch14_clip_quickgelu_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch14_clip_quickgelu_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Large model (ViT-L/14) CLIP image tower @ 336x336 w/ QuickGELU act
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1024, depth=24, num_heads=16, pre_norm=True,
-        norm_layer=nn.LayerNorm, act_layer='quick_gelu')
-    model = _create_vision_transformer(
-        'vit_large_patch14_clip_quickgelu_336', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_huge_patch14_clip_quickgelu_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Huge model (ViT-H/14) CLIP image tower w/ QuickGELU act.
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1280, depth=32, num_heads=16, pre_norm=True,
-        norm_layer=nn.LayerNorm, act_layer='quick_gelu')
-    model = _create_vision_transformer(
-        'vit_huge_patch14_clip_quickgelu_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_huge_patch14_clip_quickgelu_378(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-Huge model (ViT-H/14) CLIP image tower @ 378x378 w/ QuickGELU act
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1280, depth=32, num_heads=16, pre_norm=True,
-        norm_layer=nn.LayerNorm, act_layer='quick_gelu')
-    model = _create_vision_transformer(
-        'vit_huge_patch14_clip_quickgelu_378', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_gigantic_patch14_clip_quickgelu_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-bigG model (ViT-G/14) w/ QuickGELU act
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1664, mlp_ratio=64/13, depth=48, num_heads=16, pre_norm=True,
-        norm_layer=nn.LayerNorm, act_layer='quick_gelu')
-    model = _create_vision_transformer(
-        'vit_gigantic_patch14_clip_quickgelu_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
 # Experimental models below
 
 @register_model
-def vit_base_patch32_plus_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch32_plus_256(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/32+)
     """
     model_args = dict(patch_size=32, embed_dim=896, depth=12, num_heads=14, init_values=1e-5)
@@ -2956,7 +2200,7 @@ def vit_base_patch32_plus_256(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_base_patch16_plus_240(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_plus_240(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16+)
     """
     model_args = dict(patch_size=16, embed_dim=896, depth=12, num_heads=14, init_values=1e-5)
@@ -2966,7 +2210,7 @@ def vit_base_patch16_plus_240(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def vit_base_patch16_rpn_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_rpn_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) w/ residual post-norm
     """
     model_args = dict(
@@ -2978,7 +2222,7 @@ def vit_base_patch16_rpn_224(pretrained: bool = False, **kwargs) -> VisionTransf
 
 
 @register_model
-def vit_small_patch16_36x1_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_small_patch16_36x1_224(pretrained=False, **kwargs):
     """ ViT-Base w/ LayerScale + 36 x 1 (36 block serial) config. Experimental, may remove.
     Based on `Three things everyone should know about Vision Transformers` - https://arxiv.org/abs/2203.09795
     Paper focuses on 24x2 + 48x1 for 'Small' width but those are extremely slow.
@@ -2990,7 +2234,7 @@ def vit_small_patch16_36x1_224(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_small_patch16_18x2_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_small_patch16_18x2_224(pretrained=False, **kwargs):
     """ ViT-Small w/ LayerScale + 18 x 2 (36 block parallel) config. Experimental, may remove.
     Based on `Three things everyone should know about Vision Transformers` - https://arxiv.org/abs/2203.09795
     Paper focuses on 24x2 + 48x1 for 'Small' width but those are extremely slow.
@@ -3003,7 +2247,7 @@ def vit_small_patch16_18x2_224(pretrained: bool = False, **kwargs) -> VisionTran
 
 
 @register_model
-def vit_base_patch16_18x2_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_18x2_224(pretrained=False, **kwargs):
     """ ViT-Base w/ LayerScale + 18 x 2 (36 block parallel) config. Experimental, may remove.
     Based on `Three things everyone should know about Vision Transformers` - https://arxiv.org/abs/2203.09795
     """
@@ -3015,7 +2259,7 @@ def vit_base_patch16_18x2_224(pretrained: bool = False, **kwargs) -> VisionTrans
 
 
 @register_model
-def eva_large_patch14_196(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def eva_large_patch14_196(pretrained=False, **kwargs):
     """ EVA-large model https://arxiv.org/abs/2211.07636 /via MAE MIM pretrain"""
     model_args = dict(patch_size=14, embed_dim=1024, depth=24, num_heads=16, global_pool='avg')
     model = _create_vision_transformer(
@@ -3024,7 +2268,7 @@ def eva_large_patch14_196(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def eva_large_patch14_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def eva_large_patch14_336(pretrained=False, **kwargs):
     """ EVA-large model https://arxiv.org/abs/2211.07636 via MAE MIM pretrain"""
     model_args = dict(patch_size=14, embed_dim=1024, depth=24, num_heads=16, global_pool='avg')
     model = _create_vision_transformer('eva_large_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
@@ -3032,7 +2276,7 @@ def eva_large_patch14_336(pretrained: bool = False, **kwargs) -> VisionTransform
 
 
 @register_model
-def flexivit_small(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def flexivit_small(pretrained=False, **kwargs):
     """ FlexiViT-Small
     """
     model_args = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, no_embed_class=True)
@@ -3041,7 +2285,7 @@ def flexivit_small(pretrained: bool = False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def flexivit_base(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def flexivit_base(pretrained=False, **kwargs):
     """ FlexiViT-Base
     """
     model_args = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, no_embed_class=True)
@@ -3050,7 +2294,7 @@ def flexivit_base(pretrained: bool = False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def flexivit_large(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def flexivit_large(pretrained=False, **kwargs):
     """ FlexiViT-Large
     """
     model_args = dict(patch_size=16, embed_dim=1024, depth=24, num_heads=16, no_embed_class=True)
@@ -3059,7 +2303,7 @@ def flexivit_large(pretrained: bool = False, **kwargs) -> VisionTransformer:
 
 
 @register_model
-def vit_base_patch16_xp_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_base_patch16_xp_224(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/14) w/ parallel blocks and qk norm enabled.
     """
     model_args = dict(
@@ -3072,7 +2316,7 @@ def vit_base_patch16_xp_224(pretrained: bool = False, **kwargs) -> VisionTransfo
 
 
 @register_model
-def vit_large_patch14_xp_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_large_patch14_xp_224(pretrained=False, **kwargs):
     """ ViT-Large model (ViT-L/14) w/ parallel blocks and qk norm enabled.
     """
     model_args = dict(
@@ -3085,7 +2329,7 @@ def vit_large_patch14_xp_224(pretrained: bool = False, **kwargs) -> VisionTransf
 
 
 @register_model
-def vit_huge_patch14_xp_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
+def vit_huge_patch14_xp_224(pretrained=False, **kwargs):
     """ ViT-Huge model (ViT-H/14) w/ parallel blocks and qk norm enabled.
     """
     model_args = dict(
@@ -3094,753 +2338,6 @@ def vit_huge_patch14_xp_224(pretrained: bool = False, **kwargs) -> VisionTransfo
     )
     model = _create_vision_transformer(
         'vit_huge_patch14_xp_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_small_patch14_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-S/14 for DINOv2
-    """
-    model_args = dict(patch_size=14, embed_dim=384, depth=12, num_heads=6, init_values=1e-5)
-    model = _create_vision_transformer(
-        'vit_small_patch14_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch14_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-B/14 for DINOv2
-    """
-    model_args = dict(patch_size=14, embed_dim=768, depth=12, num_heads=12, init_values=1e-5)
-    model = _create_vision_transformer(
-        'vit_base_patch14_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch14_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-L/14 for DINOv2
-    """
-    model_args = dict(patch_size=14, embed_dim=1024, depth=24, num_heads=16, init_values=1e-5)
-    model = _create_vision_transformer(
-        'vit_large_patch14_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_giant_patch14_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-G/14 for DINOv2
-    """
-    # The hidden_features of SwiGLU is calculated by:
-    # hidden_features = (int(hidden_features * 2 / 3) + 7) // 8 * 8
-    # When embed_dim=1536, hidden_features=4096
-    # With SwiGLUPacked, we need to set hidden_features = 2 * 4096 = 8192
-    model_args = dict(
-        patch_size=14, embed_dim=1536, depth=40, num_heads=24, init_values=1e-5,
-        mlp_ratio=2.66667 * 2, mlp_layer=SwiGLUPacked, act_layer=nn.SiLU
-    )
-    model = _create_vision_transformer(
-        'vit_giant_patch14_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_small_patch14_reg4_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-S/14 for DINOv2 w/ 4 registers
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=384, depth=12, num_heads=6, init_values=1e-5,
-        reg_tokens=4, no_embed_class=True,
-    )
-    model = _create_vision_transformer(
-        'vit_small_patch14_reg4_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch14_reg4_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-B/14 for DINOv2 w/ 4 registers
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=768, depth=12, num_heads=12, init_values=1e-5,
-        reg_tokens=4, no_embed_class=True,
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch14_reg4_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch14_reg4_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-L/14 for DINOv2 w/ 4 registers
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1024, depth=24, num_heads=16, init_values=1e-5,
-        reg_tokens=4, no_embed_class=True,
-    )
-    model = _create_vision_transformer(
-        'vit_large_patch14_reg4_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_giant_patch14_reg4_dinov2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT-G/14 for DINOv2
-    """
-    # The hidden_features of SwiGLU is calculated by:
-    # hidden_features = (int(hidden_features * 2 / 3) + 7) // 8 * 8
-    # When embed_dim=1536, hidden_features=4096
-    # With SwiGLUPacked, we need to set hidden_features = 2 * 4096 = 8192
-    model_args = dict(
-        patch_size=14, embed_dim=1536, depth=40, num_heads=24, init_values=1e-5, mlp_ratio=2.66667 * 2,
-        mlp_layer=SwiGLUPacked, act_layer=nn.SiLU, reg_tokens=4, no_embed_class=True,
-    )
-    model = _create_vision_transformer(
-        'vit_giant_patch14_reg4_dinov2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_512(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_512', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch16_siglip_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=1024, depth=24, num_heads=16, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_large_patch16_siglip_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch16_siglip_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=1024, depth=24, num_heads=16, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_large_patch16_siglip_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch16_siglip_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    # this is a corrected variant of the 384 with a res properly divisible by patch size (no padding/truncation)
-    model_args = dict(
-        patch_size=16, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch16_siglip_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_378(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    # this is a corrected variant of the 384 with a res properly divisible by patch size (no padding/truncation)
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_378', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362, class_token=False, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_gap_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_gap_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_gap_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_siglip_gap_512(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_siglip_gap_512', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch16_siglip_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=16, embed_dim=1024, depth=24, num_heads=16, class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_large_patch16_siglip_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_large_patch16_siglip_gap_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=16, embed_dim=1024, depth=24, num_heads=16, class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_large_patch16_siglip_gap_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_gap_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362,
-        class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch16_siglip_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=16, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362,
-        class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch16_siglip_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_gap_378(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362,
-        class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_gap_378', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_gap_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362,
-        class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_gap_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_gap_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362,
-        class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_gap_448', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so400m_patch14_siglip_gap_896(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ A SigLIP variant of ViT with global average pooling (GAP) instead of attention pooling (MAP)."""
-    model_args = dict(
-        patch_size=14, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362,
-        class_token=False, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so400m_patch14_siglip_gap_896', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_wee_patch16_reg1_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=256, depth=14, num_heads=4, init_values=1e-5, mlp_ratio=5,
-        class_token=False, no_embed_class=True, reg_tokens=1, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_wee_patch16_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_pwee_patch16_reg1_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=256, depth=16, num_heads=4, init_values=1e-5, mlp_ratio=5,
-        class_token=False, no_embed_class=True, reg_tokens=1, global_pool='avg', block_fn=ParallelScalingBlock,
-    )
-    model = _create_vision_transformer(
-        'vit_pwee_patch16_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_little_patch16_reg1_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=320, depth=14, num_heads=5, init_values=1e-5, mlp_ratio=5.6,
-        class_token=False, no_embed_class=True, reg_tokens=1, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_little_patch16_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_little_patch16_reg4_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=320, depth=14, num_heads=5, init_values=1e-5, mlp_ratio=5.6,
-        class_token=False, no_embed_class=True, reg_tokens=4, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_little_patch16_reg4_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_medium_patch16_reg1_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=512, depth=12, num_heads=8, init_values=1e-5,
-        class_token=False, no_embed_class=True, reg_tokens=1, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_medium_patch16_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_medium_patch16_reg4_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=512, depth=12, num_heads=8, init_values=1e-5,
-        class_token=False, no_embed_class=True, reg_tokens=4, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_medium_patch16_reg4_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_mediumd_patch16_reg4_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=512, depth=20, num_heads=8, init_values=1e-5,
-        class_token=False, no_embed_class=True, reg_tokens=4, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_mediumd_patch16_reg4_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_mediumd_patch16_reg4_gap_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=512, depth=20, num_heads=8, init_values=1e-5,
-        class_token=False, no_embed_class=True, reg_tokens=4, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_mediumd_patch16_reg4_gap_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_betwixt_patch16_reg1_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=640, depth=12, num_heads=10, init_values=1e-5,
-        class_token=False, no_embed_class=True, reg_tokens=1, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_betwixt_patch16_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_betwixt_patch16_reg4_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=640, depth=12, num_heads=10, init_values=1e-5,
-        class_token=False, no_embed_class=True, reg_tokens=4, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_betwixt_patch16_reg4_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_betwixt_patch16_reg4_gap_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=640, depth=12, num_heads=10, init_values=1e-5,
-        class_token=False, no_embed_class=True, reg_tokens=4, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_betwixt_patch16_reg4_gap_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_base_patch16_reg4_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, class_token=False,
-        no_embed_class=True, global_pool='avg', reg_tokens=4,
-    )
-    model = _create_vision_transformer(
-        'vit_base_patch16_reg4_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so150m_patch16_reg4_map_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ SO150M (shape optimized, but diff than paper def, optimized for GPU) """
-    model_args = dict(
-        patch_size=16, embed_dim=896, depth=18, num_heads=14, mlp_ratio=2.572,
-        class_token=False, reg_tokens=4, global_pool='map',
-    )
-    model = _create_vision_transformer(
-        'vit_so150m_patch16_reg4_map_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so150m_patch16_reg4_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ SO150M (shape optimized, but diff than paper def, optimized for GPU) """
-    model_args = dict(
-        patch_size=16, embed_dim=896, depth=18, num_heads=14, mlp_ratio=2.572,
-        class_token=False, reg_tokens=4, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so150m_patch16_reg4_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so150m_patch16_reg4_gap_384(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ SO150M (shape optimized, but diff than paper def, optimized for GPU) """
-    model_args = dict(
-        patch_size=16, embed_dim=896, depth=18, num_heads=14, mlp_ratio=2.572,
-        class_token=False, reg_tokens=4, global_pool='avg', fc_norm=False,
-    )
-    model = _create_vision_transformer(
-        'vit_so150m_patch16_reg4_gap_384', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_so150m2_patch16_reg1_gap_256(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ SO150M v2 (shape optimized, but diff than paper def, optimized for GPU) """
-    model_args = dict(
-        patch_size=16, embed_dim=832, depth=21, num_heads=13, mlp_ratio=34/13, init_values=1e-5,
-        qkv_bias=False, class_token=False, reg_tokens=1, global_pool='avg',
-    )
-    model = _create_vision_transformer(
-        'vit_so150m2_patch16_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def vit_intern300m_patch14_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    model_args = dict(
-        patch_size=14, embed_dim=1024, depth=24, num_heads=16,
-        init_values=0.1, final_norm=False, dynamic_img_size=True,
-    )
-    model = _create_vision_transformer(
-        'vit_intern300m_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_large_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Large AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1024, depth=24, num_heads=8, class_token=False, fc_norm=False,
-        mlp_ratio=2.75, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_large_patch14_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_huge_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Huge AIM-v2 model
-    """
-
-    model_args = dict(
-        patch_size=14, embed_dim=1536, depth=24, num_heads=12, class_token=False, fc_norm=False,
-        mlp_ratio=2.6667, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_huge_patch14_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_1b_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT 1B AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=2048, depth=24, num_heads=16, class_token=False, fc_norm=False,
-        mlp_ratio=2.75, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_1b_patch14_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_3b_patch14_224(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT 3B AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=3072, depth=24, num_heads=24, class_token=False, fc_norm=False,
-        mlp_ratio=2.6667, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_3b_patch14_224', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_large_patch14_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Large AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1024, depth=24, num_heads=8, class_token=False, fc_norm=False,
-        mlp_ratio=2.75, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_large_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_huge_patch14_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Huge AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1536, depth=24, num_heads=12, class_token=False, fc_norm=False,
-        mlp_ratio=2.6667, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_huge_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_1b_patch14_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT 1B AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=2048, depth=24, num_heads=16, class_token=False, fc_norm=False,
-        mlp_ratio=2.75, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_1b_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_3b_patch14_336(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT 3B AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=3072, depth=24, num_heads=24, class_token=False, fc_norm=False,
-        mlp_ratio=2.6667, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_3b_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_large_patch14_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Large AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1024, depth=24, num_heads=8, class_token=False, fc_norm=False,
-        mlp_ratio=2.75, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_large_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_huge_patch14_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Huge AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=1536, depth=24, num_heads=12, class_token=False, fc_norm=False,
-        mlp_ratio=2.6667, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_huge_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_1b_patch14_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT 1B AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=2048, depth=24, num_heads=16, class_token=False, fc_norm=False,
-        mlp_ratio=2.75, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_1b_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def aimv2_3b_patch14_448(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT 3B AIM-v2 model
-    """
-    model_args = dict(
-        patch_size=14, embed_dim=3072, depth=24, num_heads=24, class_token=False, fc_norm=False,
-        mlp_ratio=2.6667, global_pool='avg', qkv_bias=False, proj_bias=False, act_layer='silu',
-        norm_layer=partial(RmsNorm, eps=1e-5), embed_norm_layer=partial(RmsNorm, eps=1e-5), mlp_layer=SwiGLU,
-    )
-    model = _create_vision_transformer(
-        'aimv2_3b_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def test_vit(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Test
-    """
-    model_args = dict(patch_size=16, embed_dim=64, depth=6, num_heads=2, mlp_ratio=3, dynamic_img_size=True)
-    model = _create_vision_transformer('test_vit', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def test_vit2(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Test
-    """
-    model_args = dict(
-        patch_size=16, embed_dim=64, depth=8, num_heads=2, mlp_ratio=3,
-        class_token=False, reg_tokens=1, global_pool='avg', init_values=1e-5, dynamic_img_size=True)
-    model = _create_vision_transformer('test_vit2', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def test_vit3(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Test
-    """
-    model_args = dict(
-        patch_size=16, embed_dim=96, depth=9, num_heads=3, mlp_ratio=2,
-        class_token=False, reg_tokens=1, global_pool='map', init_values=1e-5)
-    model = _create_vision_transformer('test_vit3', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def test_vit4(pretrained: bool = False, **kwargs) -> VisionTransformer:
-    """ ViT Test
-    """
-    model_args = dict(
-        patch_size=16, embed_dim=96, depth=9, num_heads=3, mlp_ratio=3,
-        class_token=False, reg_tokens=1, global_pool='avg', init_values=1e-5, dynamic_img_size=True,
-        norm_layer='rmsnorm',
-    )
-    model = _create_vision_transformer('test_vit4', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 

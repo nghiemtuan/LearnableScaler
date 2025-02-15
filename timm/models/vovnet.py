@@ -11,7 +11,7 @@ for some reference, rewrote most of the code.
 Hacked together by / Copyright 2020 Ross Wightman
 """
 
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -134,17 +134,9 @@ class OsaStage(nn.Module):
             else:
                 drop_path = None
             blocks += [OsaBlock(
-                in_chs,
-                mid_chs,
-                out_chs,
-                layer_per_block,
-                residual=residual and i > 0,
-                depthwise=depthwise,
-                attn=attn if last_block else '',
-                norm_layer=norm_layer,
-                act_layer=act_layer,
-                drop_path=drop_path
-            )]
+                in_chs, mid_chs, out_chs, layer_per_block, residual=residual and i > 0, depthwise=depthwise,
+                attn=attn if last_block else '', norm_layer=norm_layer, act_layer=act_layer, drop_path=drop_path)
+            ]
             in_chs = out_chs
         self.blocks = nn.Sequential(*blocks)
 
@@ -235,7 +227,6 @@ class VovNet(nn.Module):
 
         self.stages = nn.Sequential(*stages)
 
-        self.head_hidden_size = self.num_features
         self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate)
 
         for n, m in self.named_modules():
@@ -257,19 +248,18 @@ class VovNet(nn.Module):
             s.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes, global_pool: Optional[str] = None):
-        self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool)
+    def reset_classifier(self, num_classes, global_pool='avg'):
+        self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=self.drop_rate)
 
     def forward_features(self, x):
         x = self.stem(x)
         return self.stages(x)
 
     def forward_head(self, x, pre_logits: bool = False):
-        return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
+        return self.head(x, pre_logits=pre_logits)
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -419,12 +409,7 @@ default_cfgs = generate_default_cfgs({
     'ese_vovnet39b.ra_in1k': _cfg(
         hf_hub_id='timm/',
         test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'ese_vovnet57b.ra4_e3600_r256_in1k': _cfg(
-        hf_hub_id='timm/',
-        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
-        crop_pct=0.95, input_size=(3, 256, 256), pool_size=(8, 8),
-        test_input_size=(3, 320, 320), test_crop_pct=1.0
-    ),
+    'ese_vovnet57b.untrained': _cfg(url=''),
     'ese_vovnet99b.untrained': _cfg(url=''),
     'eca_vovnet39b.untrained': _cfg(url=''),
     'ese_vovnet39b_evos.untrained': _cfg(url=''),
@@ -432,54 +417,54 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def vovnet39a(pretrained=False, **kwargs) -> VovNet:
+def vovnet39a(pretrained=False, **kwargs):
     return _create_vovnet('vovnet39a', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def vovnet57a(pretrained=False, **kwargs) -> VovNet:
+def vovnet57a(pretrained=False, **kwargs):
     return _create_vovnet('vovnet57a', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def ese_vovnet19b_slim_dw(pretrained=False, **kwargs) -> VovNet:
+def ese_vovnet19b_slim_dw(pretrained=False, **kwargs):
     return _create_vovnet('ese_vovnet19b_slim_dw', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def ese_vovnet19b_dw(pretrained=False, **kwargs) -> VovNet:
+def ese_vovnet19b_dw(pretrained=False, **kwargs):
     return _create_vovnet('ese_vovnet19b_dw', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def ese_vovnet19b_slim(pretrained=False, **kwargs) -> VovNet:
+def ese_vovnet19b_slim(pretrained=False, **kwargs):
     return _create_vovnet('ese_vovnet19b_slim', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def ese_vovnet39b(pretrained=False, **kwargs) -> VovNet:
+def ese_vovnet39b(pretrained=False, **kwargs):
     return _create_vovnet('ese_vovnet39b', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def ese_vovnet57b(pretrained=False, **kwargs) -> VovNet:
+def ese_vovnet57b(pretrained=False, **kwargs):
     return _create_vovnet('ese_vovnet57b', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def ese_vovnet99b(pretrained=False, **kwargs) -> VovNet:
+def ese_vovnet99b(pretrained=False, **kwargs):
     return _create_vovnet('ese_vovnet99b', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def eca_vovnet39b(pretrained=False, **kwargs) -> VovNet:
+def eca_vovnet39b(pretrained=False, **kwargs):
     return _create_vovnet('eca_vovnet39b', pretrained=pretrained, **kwargs)
 
 
 # Experimental Models
 
 @register_model
-def ese_vovnet39b_evos(pretrained=False, **kwargs) -> VovNet:
+def ese_vovnet39b_evos(pretrained=False, **kwargs):
     def norm_act_fn(num_features, **nkwargs):
         return create_norm_act_layer('evonorms0', num_features, jit=False, **nkwargs)
     return _create_vovnet('ese_vovnet39b_evos', pretrained=pretrained, norm_layer=norm_act_fn, **kwargs)

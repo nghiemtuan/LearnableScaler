@@ -25,7 +25,7 @@ def find_images_and_targets(
     """ Walk folder recursively to discover images and map them to classes by folder names.
 
     Args:
-        folder: root of folder to recursively search
+        folder: root of folder to recrusively search
         types: types (file extensions) to search for in path
         class_to_idx: specify mapping for class (folder name) to class index if set
         leaf_name_only: use only leaf-name of folder walk for class names
@@ -61,23 +61,14 @@ class ReaderImageFolder(Reader):
     def __init__(
             self,
             root,
-            class_map='',
-            input_key=None,
-    ):
+            class_map=''):
         super().__init__()
 
         self.root = root
         class_to_idx = None
         if class_map:
             class_to_idx = load_class_map(class_map, root)
-        find_types = None
-        if input_key:
-            find_types = input_key.split(';')
-        self.samples, self.class_to_idx = find_images_and_targets(
-            root,
-            class_to_idx=class_to_idx,
-            types=find_types,
-        )
+        self.samples, self.class_to_idx = find_images_and_targets(root, class_to_idx=class_to_idx)
         if len(self.samples) == 0:
             raise RuntimeError(
                 f'Found 0 images in subfolders of {root}. '

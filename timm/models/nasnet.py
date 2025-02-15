@@ -3,7 +3,6 @@
  https://github.com/Cadene/pretrained-models.pytorch
 """
 from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -408,7 +407,7 @@ class NASNetALarge(nn.Module):
         super(NASNetALarge, self).__init__()
         self.num_classes = num_classes
         self.stem_size = stem_size
-        self.num_features = self.head_hidden_size = num_features
+        self.num_features = num_features
         self.channel_multiplier = channel_multiplier
         assert output_stride == 32
 
@@ -515,10 +514,10 @@ class NASNetALarge(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.last_linear
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.last_linear = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
@@ -554,10 +553,11 @@ class NASNetALarge(nn.Module):
         x = self.act(x_cell_17)
         return x
 
-    def forward_head(self, x, pre_logits: bool = False):
+    def forward_head(self, x):
         x = self.global_pool(x)
         x = self.head_drop(x)
-        return x if pre_logits else self.last_linear(x)
+        x = self.last_linear(x)
+        return x
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -588,12 +588,13 @@ default_cfgs = generate_default_cfgs({
         'num_classes': 1000,
         'first_conv': 'conv0.conv',
         'classifier': 'last_linear',
+        'label_offset': 1,  # 1001 classes in pretrained weights
     },
 })
 
 
 @register_model
-def nasnetalarge(pretrained=False, **kwargs) -> NASNetALarge:
+def nasnetalarge(pretrained=False, **kwargs):
     """NASNet-A large model architecture.
     """
     model_kwargs = dict(pad_type='same', **kwargs)

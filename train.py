@@ -15,9 +15,6 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
-import copy
-import importlib
-import json
 import logging
 import os
 import time
@@ -31,7 +28,6 @@ import torch.nn as nn
 import torchvision.utils
 import yaml
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
-import numpy as np
 
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
@@ -41,6 +37,7 @@ from timm.models import create_model, safe_model_name, resume_checkpoint, load_c
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
+import numpy as np
 
 try:
     from apex import amp
@@ -50,6 +47,12 @@ try:
 except ImportError:
     has_apex = False
 
+has_native_amp = False
+try:
+    if getattr(torch.cuda.amp, 'autocast') is not None:
+        has_native_amp = True
+except AttributeError:
+    pass
 
 try:
     import wandb
@@ -82,30 +85,18 @@ group = parser.add_argument_group('Dataset parameters')
 # Keep this argument outside the dataset group because it is positional.
 parser.add_argument('data', nargs='?', metavar='DIR', const=None,
                     help='path to dataset (positional is *deprecated*, use --data-dir)')
-group.add_argument('--data-dir', metavar='DIR',
+parser.add_argument('--data-dir', metavar='DIR',
                     help='path to dataset (root dir)')
-group.add_argument('--dataset', metavar='NAME', default='',
+parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
 group.add_argument('--train-split', metavar='NAME', default='train',
                    help='dataset train split (default: train)')
 group.add_argument('--val-split', metavar='NAME', default='validation',
                    help='dataset validation split (default: validation)')
-group.add_argument('--train-num-samples', default=None, type=int,
-                    metavar='N', help='Manually specify num samples in train split, for IterableDatasets.')
-group.add_argument('--val-num-samples', default=None, type=int,
-                    metavar='N', help='Manually specify num samples in validation split, for IterableDatasets.')
 group.add_argument('--dataset-download', action='store_true', default=False,
                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                    help='path to class to idx mapping file (default: "")')
-group.add_argument('--input-img-mode', default=None, type=str,
-                   help='Dataset image conversion mode for input images.')
-group.add_argument('--input-key', default=None, type=str,
-                   help='Dataset key for input images.')
-group.add_argument('--target-key', default=None, type=str,
-                   help='Dataset key for target labels.')
-group.add_argument('--dataset-trust-remote-code', action='store_true', default=False,
-                   help='Allow huggingface dataset import to execute code downloaded from the dataset\'s repo.')
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
@@ -113,10 +104,8 @@ group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
 group.add_argument('--pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified network (if avail)')
-group.add_argument('--pretrained-path', default=None, type=str,
-                   help='Load this checkpoint as if they were the pretrained weights (with adaptation).')
 group.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
-                   help='Load this checkpoint into model after initialization (default: none)')
+                   help='Initialize model from this checkpoint (default: none)')
 group.add_argument('--resume', default='', type=str, metavar='PATH',
                    help='Resume full model and optimizer state from checkpoint (default: none)')
 group.add_argument('--no-resume-opt', action='store_true', default=False,
@@ -129,7 +118,8 @@ group.add_argument('--img-size', type=int, default=None, metavar='N',
                    help='Image size (default: None => model default)')
 group.add_argument('--in-chans', type=int, default=None, metavar='N',
                    help='Image input channels (default: None => 3)')
-group.add_argument('--input-size', default=None, nargs=3, type=int, metavar='N',
+group.add_argument('--input-size', default=None, nargs=3, type=int,
+                   metavar='N N N',
                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 group.add_argument('--crop-pct', default=None, type=float,
                    metavar='N', help='Input image center crop percent (for validation only)')
@@ -158,8 +148,6 @@ group.add_argument('--head-init-scale', default=None, type=float,
                    help='Head initialization scale')
 group.add_argument('--head-init-bias', default=None, type=float,
                    help='Head initialization bias value')
-group.add_argument('--torchcompile-mode', type=str, default=None,
-                    help="torch.compile mode (default: None).")
 
 # scripting / codegen
 scripting_group = group.add_mutually_exclusive_group()
@@ -167,26 +155,6 @@ scripting_group.add_argument('--torchscript', dest='torchscript', action='store_
                              help='torch.jit.script the full model')
 scripting_group.add_argument('--torchcompile', nargs='?', type=str, default=None, const='inductor',
                              help="Enable compilation w/ specified backend (default: inductor).")
-
-# Device & distributed
-group = parser.add_argument_group('Device parameters')
-group.add_argument('--device', default='cuda', type=str,
-                    help="Device (accelerator) to use.")
-group.add_argument('--amp', action='store_true', default=False,
-                   help='use NVIDIA Apex AMP or Native AMP for mixed precision training')
-group.add_argument('--amp-dtype', default='float16', type=str,
-                   help='lower precision AMP dtype (default: float16)')
-group.add_argument('--amp-impl', default='native', type=str,
-                   help='AMP impl to use, "native" or "apex" (default: native)')
-group.add_argument('--model-dtype', default=None, type=str,
-                   help='Model dtype override (non-AMP) (default: float32)')
-group.add_argument('--no-ddp-bb', action='store_true', default=False,
-                   help='Force broadcast buffers for native DDP to off.')
-group.add_argument('--synchronize-step', action='store_true', default=False,
-                   help='torch.cuda.synchronize() end of each step')
-group.add_argument("--local_rank", default=0, type=int)
-group.add_argument('--device-modules', default=None, type=str, nargs='+',
-                    help="Python imports for device backend modules.")
 
 # Optimizer parameters
 group = parser.add_argument_group('Optimizer parameters')
@@ -211,7 +179,7 @@ group.add_argument('--opt-kwargs', nargs='*', default={}, action=utils.ParseKwar
 # Learning rate schedule parameters
 group = parser.add_argument_group('Learning rate schedule parameters')
 group.add_argument('--sched', type=str, default='cosine', metavar='SCHEDULER',
-                   help='LR scheduler (default: "cosine"')
+                   help='LR scheduler (default: "step"')
 group.add_argument('--sched-on-updates', action='store_true', default=False,
                    help='Apply LR scheduler step on update instead of epoch end.')
 group.add_argument('--lr', type=float, default=None, metavar='LR',
@@ -265,8 +233,6 @@ group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RAT
 group = parser.add_argument_group('Augmentation and regularization parameters')
 group.add_argument('--no-aug', action='store_true', default=False,
                    help='Disable all training augmentation, override other train aug args')
-group.add_argument('--train-crop-mode', type=str, default=None,
-                   help='Crop-mode in train'),
 group.add_argument('--scale', type=float, nargs='+', default=[0.08, 1.0], metavar='PCT',
                    help='Random resize scale (default: 0.08 1.0)')
 group.add_argument('--ratio', type=float, nargs='+', default=[3. / 4., 4. / 3.], metavar='RATIO',
@@ -277,12 +243,6 @@ group.add_argument('--vflip', type=float, default=0.,
                    help='Vertical flip training aug probability')
 group.add_argument('--color-jitter', type=float, default=0.4, metavar='PCT',
                    help='Color jitter factor (default: 0.4)')
-group.add_argument('--color-jitter-prob', type=float, default=None, metavar='PCT',
-                   help='Probability of applying any color jitter.')
-group.add_argument('--grayscale-prob', type=float, default=None, metavar='PCT',
-                   help='Probability of applying random grayscale conversion.')
-group.add_argument('--gaussian-blur-prob', type=float, default=None, metavar='PCT',
-                   help='Probability of applying gaussian blur.')
 group.add_argument('--aa', type=str, default=None, metavar='NAME',
                    help='Use AutoAugment policy. "v0" or "original". (default: None)'),
 group.add_argument('--aug-repeats', type=float, default=0,
@@ -293,12 +253,8 @@ group.add_argument('--jsd-loss', action='store_true', default=False,
                    help='Enable Jensen-Shannon Divergence + CE loss. Use with `--aug-splits`.')
 group.add_argument('--bce-loss', action='store_true', default=False,
                    help='Enable BCE loss w/ Mixup/CutMix use.')
-group.add_argument('--bce-sum', action='store_true', default=False,
-                   help='Sum over classes when using BCE loss.')
 group.add_argument('--bce-target-thresh', type=float, default=None,
-                   help='Threshold for binarizing softened BCE targets (default: None, disabled).')
-group.add_argument('--bce-pos-weight', type=float, default=None,
-                   help='Positive weighting for BCE loss.')
+                   help='Threshold for binarizing softened BCE targets (default: None, disabled)')
 group.add_argument('--reprob', type=float, default=0., metavar='PCT',
                    help='Random erase prob (default: 0.)')
 group.add_argument('--remode', type=str, default='pixel',
@@ -350,13 +306,11 @@ group.add_argument('--split-bn', action='store_true',
 # Model Exponential Moving Average
 group = parser.add_argument_group('Model exponential moving average parameters')
 group.add_argument('--model-ema', action='store_true', default=False,
-                   help='Enable tracking moving average of model weights.')
+                   help='Enable tracking moving average of model weights')
 group.add_argument('--model-ema-force-cpu', action='store_true', default=False,
                    help='Force ema to be tracked on CPU, rank=0 node only. Disables EMA validation.')
 group.add_argument('--model-ema-decay', type=float, default=0.9998,
-                   help='Decay factor for model weights moving average (default: 0.9998)')
-group.add_argument('--model-ema-warmup', action='store_true',
-                   help='Enable warmup for model EMA decay.')
+                   help='decay factor for model weights moving average (default: 0.9998)')
 
 # Misc
 group = parser.add_argument_group('Miscellaneous parameters')
@@ -368,12 +322,22 @@ group.add_argument('--log-interval', type=int, default=50, metavar='N',
                    help='how many batches to wait before logging training status')
 group.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                    help='how many batches to wait before writing recovery checkpoint')
-group.add_argument('--checkpoint-hist', type=int, default=2, metavar='N',
+group.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
                    help='number of checkpoints to keep (default: 10)')
 group.add_argument('-j', '--workers', type=int, default=4, metavar='N',
                    help='how many training processes to use (default: 4)')
 group.add_argument('--save-images', action='store_true', default=False,
-                   help='save images of input batches every log interval for debugging')
+                   help='save images of input bathes every log interval for debugging')
+group.add_argument('--amp', action='store_true', default=False,
+                   help='use NVIDIA Apex AMP or Native AMP for mixed precision training')
+group.add_argument('--amp-dtype', default='float16', type=str,
+                   help='lower precision AMP dtype (default: float16)')
+group.add_argument('--amp-impl', default='native', type=str,
+                   help='AMP impl to use, "native" or "apex" (default: native)')
+group.add_argument('--no-ddp-bb', action='store_true', default=False,
+                   help='Force broadcast buffers for native DDP to off.')
+group.add_argument('--synchronize-step', action='store_true', default=False,
+                   help='torch.cuda.synchronize() end of each step')
 group.add_argument('--pin-mem', action='store_true', default=False,
                    help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
 group.add_argument('--no-prefetcher', action='store_true', default=False,
@@ -386,16 +350,11 @@ group.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METR
                    help='Best metric (default: "top1"')
 group.add_argument('--tta', type=int, default=0, metavar='N',
                    help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
+group.add_argument("--local_rank", default=0, type=int)
 group.add_argument('--use-multi-epochs-loader', action='store_true', default=False,
                    help='use the multi-epochs-loader to save time at the beginning of every epoch')
 group.add_argument('--log-wandb', action='store_true', default=False,
                    help='log training and validation metrics to wandb')
-group.add_argument('--wandb-project', default=None, type=str,
-                   help='wandb project name')
-group.add_argument('--wandb-tags', default=[], type=str, nargs='+',
-                   help='wandb tags')
-group.add_argument('--wandb-resume-id', default='', type=str, metavar='ID',
-                   help='If resuming a run, the id of the run in wandb')
 
 group.add_argument('--epoch-factor', '--ef', type=float, default=0.8, metavar='RATE',
                    help='used in custom scheduler (default: 0.8)')
@@ -444,10 +403,6 @@ def main():
     utils.setup_default_logging()
     args, args_text = _parse_args()
 
-    if args.device_modules:
-        for module in args.device_modules:
-            importlib.import_module(module)
-
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
@@ -463,23 +418,16 @@ def main():
         _logger.info(f'Training with a single process on 1 device ({args.device}).')
     assert args.rank >= 0
 
-    model_dtype = None
-    if args.model_dtype:
-        assert args.model_dtype in ('float32', 'float16', 'bfloat16')
-        model_dtype = getattr(torch, args.model_dtype)
-        if model_dtype == torch.float16:
-            _logger.warning('float16 is not recommended for training, for half precision bfloat16 is recommended.')
-
     # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
     amp_dtype = torch.float16
     if args.amp:
-        assert model_dtype is None or model_dtype == torch.float32, 'float32 model dtype must be used with AMP'
         if args.amp_impl == 'apex':
             assert has_apex, 'AMP impl specified as APEX but APEX is not installed.'
             use_amp = 'apex'
             assert args.amp_dtype == 'float16'
         else:
+            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
             use_amp = 'native'
             assert args.amp_dtype in ('float16', 'bfloat16')
         if args.amp_dtype == 'bfloat16':
@@ -498,14 +446,6 @@ def main():
     elif args.input_size is not None:
         in_chans = args.input_size[0]
 
-    factory_kwargs = {}
-    if args.pretrained_path:
-        # merge with pretrained_cfg of model, 'file' has priority over 'url' and 'hf_hub'.
-        factory_kwargs['pretrained_cfg_overlay'] = dict(
-            file=args.pretrained_path,
-            num_classes=-1,  # force head adaptation
-        )
-
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -519,7 +459,6 @@ def main():
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint,
-        **factory_kwargs,
         **args.model_kwargs,
     )
 
@@ -566,7 +505,7 @@ def main():
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
 
     # move model to GPU, enable channels last layout if set
-    model.to(device=device, dtype=model_dtype)  # FIXME move model device & dtype into create_model
+    model.to(device=device)
     if args.channels_last:
         model.to(memory_format=torch.channels_last)
 
@@ -610,13 +549,6 @@ def main():
         **optimizer_kwargs(cfg=args),
         **args.opt_kwargs,
     )
-    if utils.is_primary(args):
-        defaults = copy.deepcopy(optimizer.defaults)
-        defaults['weight_decay'] = args.weight_decay  # this isn't stored in optimizer.defaults
-        defaults = ', '.join([f'{k}: {v}' for k, v in defaults.items()])
-        logging.info(
-            f'Created {type(optimizer).__name__} ({args.opt}) optimizer: {defaults}'
-        )
 
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
@@ -628,15 +560,20 @@ def main():
         if utils.is_primary(args):
             _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
     elif use_amp == 'native':
-        amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
-        if device.type in ('cuda',) and amp_dtype == torch.float16:
+        try:
+            amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
+        except (AttributeError, TypeError):
+            # fallback to CUDA only AMP for PyTorch < 1.10
+            assert device.type == 'cuda'
+            amp_autocast = torch.cuda.amp.autocast
+        if device.type == 'cuda' and amp_dtype == torch.float16:
             # loss scaler only used for float16 (half) dtype, bfloat16 does not need it
-            loss_scaler = NativeScaler(device=device.type)
+            loss_scaler = NativeScaler()
         if utils.is_primary(args):
             _logger.info('Using native Torch AMP. Training in mixed precision.')
     else:
         if utils.is_primary(args):
-            _logger.info(f'AMP not enabled. Training in {model_dtype or torch.float32}.')
+            _logger.info('AMP not enabled. Training in float32.')
 
     # optionally resume from a checkpoint
     resume_epoch = None
@@ -653,16 +590,10 @@ def main():
     model_ema = None
     if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before DDP wrapper
-        model_ema = utils.ModelEmaV3(
-            model,
-            decay=args.model_ema_decay,
-            use_warmup=args.model_ema_warmup,
-            device='cpu' if args.model_ema_force_cpu else None,
-        )
+        model_ema = utils.ModelEmaV2(
+            model, decay=args.model_ema_decay, device='cpu' if args.model_ema_force_cpu else None)
         if args.resume:
             load_checkpoint(model_ema.module, args.resume, use_ema=True)
-        if args.torchcompile:
-            model_ema = torch.compile(model_ema, backend=args.torchcompile)
 
     # setup distributed training
     if args.distributed:
@@ -680,16 +611,11 @@ def main():
     if args.torchcompile:
         # torch compile should be done after DDP
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
-        model = torch.compile(model, backend=args.torchcompile, mode=args.torchcompile_mode)
+        model = torch.compile(model, backend=args.torchcompile)
 
     # create the train and eval datasets
     if args.data and not args.data_dir:
         args.data_dir = args.data
-    if args.input_img_mode is None:
-        input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
-    else:
-        input_img_mode = args.input_img_mode
-
     dataset_train = create_dataset(
         args.dataset,
         root=args.data_dir,
@@ -700,28 +626,17 @@ def main():
         batch_size=args.batch_size,
         seed=args.seed,
         repeats=args.epoch_repeats,
-        input_img_mode=input_img_mode,
-        input_key=args.input_key,
-        target_key=args.target_key,
-        num_samples=args.train_num_samples,
-        trust_remote_code=args.dataset_trust_remote_code,
     )
 
-    if args.val_split:
-        dataset_eval = create_dataset(
-            args.dataset,
-            root=args.data_dir,
-            split=args.val_split,
-            is_training=False,
-            class_map=args.class_map,
-            download=args.dataset_download,
-            batch_size=args.batch_size,
-            input_img_mode=input_img_mode,
-            input_key=args.input_key,
-            target_key=args.target_key,
-            num_samples=args.val_num_samples,
-            trust_remote_code=args.dataset_trust_remote_code,
-        )
+    dataset_eval = create_dataset(
+        args.dataset,
+        root=args.data_dir,
+        split=args.val_split,
+        is_training=False,
+        class_map=args.class_map,
+        download=args.dataset_download,
+        batch_size=args.batch_size,
+    )
 
     # setup mixup / cutmix
     collate_fn = None
@@ -739,7 +654,7 @@ def main():
             num_classes=args.num_classes
         )
         if args.prefetcher:
-            assert not num_aug_splits  # collate conflict (need to support de-interleaving in collate mixup)
+            assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
             collate_fn = FastCollateMixup(**mixup_args)
         else:
             mixup_fn = Mixup(**mixup_args)
@@ -748,7 +663,7 @@ def main():
     if num_aug_splits > 1:
         dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
 
-    # create data loaders w/ augmentation pipeline
+    # create data loaders w/ augmentation pipeiine
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
@@ -757,20 +672,17 @@ def main():
         input_size=data_config['input_size'],
         batch_size=args.batch_size,
         is_training=True,
+        use_prefetcher=args.prefetcher,
         no_aug=args.no_aug,
         re_prob=args.reprob,
         re_mode=args.remode,
         re_count=args.recount,
         re_split=args.resplit,
-        train_crop_mode=args.train_crop_mode,
         scale=args.scale,
         ratio=args.ratio,
         hflip=args.hflip,
         vflip=args.vflip,
         color_jitter=args.color_jitter,
-        color_jitter_prob=args.color_jitter_prob,
-        grayscale_prob=args.grayscale_prob,
-        gaussian_blur_prob=args.gaussian_blur_prob,
         auto_augment=args.aa,
         num_aug_repeats=args.aug_repeats,
         num_aug_splits=num_aug_splits,
@@ -781,35 +693,30 @@ def main():
         distributed=args.distributed,
         collate_fn=collate_fn,
         pin_memory=args.pin_mem,
-        img_dtype=model_dtype or torch.float32,
         device=device,
-        use_prefetcher=args.prefetcher,
         use_multi_epochs_loader=args.use_multi_epochs_loader,
         worker_seeding=args.worker_seeding,
     )
 
-    loader_eval = None
-    if args.val_split:
-        eval_workers = args.workers
-        if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
-            # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
-            eval_workers = min(2, args.workers)
-        loader_eval = create_loader(
-            dataset_eval,
-            input_size=data_config['input_size'],
-            batch_size=args.validation_batch_size or args.batch_size,
-            is_training=False,
-            interpolation=data_config['interpolation'],
-            mean=data_config['mean'],
-            std=data_config['std'],
-            num_workers=eval_workers,
-            distributed=args.distributed,
-            crop_pct=data_config['crop_pct'],
-            pin_memory=args.pin_mem,
-            img_dtype=model_dtype or torch.float32,
-            device=device,
-            use_prefetcher=args.prefetcher,
-        )
+    eval_workers = args.workers
+    if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
+        # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
+        eval_workers = min(2, args.workers)
+    loader_eval = create_loader(
+        dataset_eval,
+        input_size=data_config['input_size'],
+        batch_size=args.validation_batch_size or args.batch_size,
+        is_training=False,
+        use_prefetcher=args.prefetcher,
+        interpolation=data_config['interpolation'],
+        mean=data_config['mean'],
+        std=data_config['std'],
+        num_workers=eval_workers,
+        distributed=args.distributed,
+        crop_pct=data_config['crop_pct'],
+        pin_memory=args.pin_mem,
+        device=device,
+    )
 
     # setup loss function
     if args.jsd_loss:
@@ -818,21 +725,12 @@ def main():
     elif mixup_active:
         # smoothing is handled with mixup target transform which outputs sparse, soft targets
         if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(
-                target_threshold=args.bce_target_thresh,
-                sum_classes=args.bce_sum,
-                pos_weight=args.bce_pos_weight,
-            )
+            train_loss_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
         else:
             train_loss_fn = SoftTargetCrossEntropy()
     elif args.smoothing:
         if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(
-                smoothing=args.smoothing,
-                target_threshold=args.bce_target_thresh,
-                sum_classes=args.bce_sum,
-                pos_weight=args.bce_pos_weight,
-            )
+            train_loss_fn = BinaryCrossEntropy(smoothing=args.smoothing, target_threshold=args.bce_target_thresh)
         else:
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
@@ -841,8 +739,7 @@ def main():
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
 
     # setup checkpoint saver and eval metric tracking
-    eval_metric = args.eval_metric if loader_eval is not None else 'loss'
-    decreasing_metric = eval_metric == 'loss'
+    eval_metric = args.eval_metric
     best_metric = None
     best_epoch = None
     saver = None
@@ -857,6 +754,7 @@ def main():
                 str(data_config['input_size'][-1])
             ])
         output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
+        decreasing = True if eval_metric == 'loss' else False
         saver = utils.CheckpointSaver(
             model=model,
             optimizer=optimizer,
@@ -865,27 +763,19 @@ def main():
             amp_scaler=loss_scaler,
             checkpoint_dir=output_dir,
             recovery_dir=output_dir,
-            decreasing=decreasing_metric,
+            decreasing=decreasing,
             max_history=args.checkpoint_hist
         )
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
-        if args.log_wandb:
-            if has_wandb:
-                assert not args.wandb_resume_id or args.resume
-                wandb.init(
-                    project=args.wandb_project,
-                    name=exp_name,
-                    config=args,
-                    tags=args.wandb_tags,
-                    resume="must" if args.wandb_resume_id else None,
-                    id=args.wandb_resume_id if args.wandb_resume_id else None,
-                )
-            else:
-                _logger.warning(
-                    "You've requested to log metrics to wandb but package not found. "
-                    "Metrics not being logged to wandb, try `pip install wandb`")
+    if utils.is_primary(args) and args.log_wandb:
+        if has_wandb:
+            wandb.init(project=args.experiment, config=args)
+        else:
+            _logger.warning(
+                "You've requested to log metrics to wandb but package not found. "
+                "Metrics not being logged to wandb, try `pip install wandb`")
 
     # setup learning rate schedule and starting epoch
     updates_per_epoch = (len(loader_train) + args.grad_accum_steps - 1) // args.grad_accum_steps
@@ -912,16 +802,9 @@ def main():
             lr_scheduler.step(start_epoch)
 
     if utils.is_primary(args):
-        if args.warmup_prefix:
-            sched_explain = '(warmup_epochs + epochs + cooldown_epochs). Warmup added to total when warmup_prefix=True'
-        else:
-            sched_explain = '(epochs + cooldown_epochs). Warmup within epochs when warmup_prefix=False'
         _logger.info(
-            f'Scheduled epochs: {num_epochs} {sched_explain}. '
-            f'LR stepped per {"epoch" if (args.sched == "custom" or lr_scheduler.t_in_epochs) else "update"}')
-            #f'LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
+            f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if (args.sched == "custom" or args.sched == "custom_cosine" or args.sched == "linear" or args.sched == "custom1" or lr_scheduler.t_in_epochs) else "update"}.')
 
-    results = []
     try:
         for epoch in range(start_epoch, num_epochs):
             if hasattr(dataset_train, 'set_epoch'):
@@ -941,10 +824,8 @@ def main():
                 output_dir=output_dir,
                 amp_autocast=amp_autocast,
                 loss_scaler=loss_scaler,
-                model_dtype=model_dtype,
                 model_ema=model_ema,
                 mixup_fn=mixup_fn,
-                num_updates_total=num_epochs * updates_per_epoch,
             )
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -952,33 +833,27 @@ def main():
                     _logger.info("Distributing BatchNorm running means and vars")
                 utils.distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-            if loader_eval is not None:
-                eval_metrics = validate(
-                    model,
+            eval_metrics = validate(
+                model,
+                loader_eval,
+                validate_loss_fn,
+                args,
+                amp_autocast=amp_autocast,
+            )
+
+            if model_ema is not None and not args.model_ema_force_cpu:
+                if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
+                    utils.distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
+
+                ema_eval_metrics = validate(
+                    model_ema.module,
                     loader_eval,
                     validate_loss_fn,
                     args,
-                    device=device,
                     amp_autocast=amp_autocast,
-                    model_dtype=model_dtype,
+                    log_suffix=' (EMA)',
                 )
-
-                if model_ema is not None and not args.model_ema_force_cpu:
-                    if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                        utils.distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
-
-                    ema_eval_metrics = validate(
-                        model_ema,
-                        loader_eval,
-                        validate_loss_fn,
-                        args,
-                        device=device,
-                        amp_autocast=amp_autocast,
-                        log_suffix=' (EMA)',
-                    )
-                    eval_metrics = ema_eval_metrics
-            else:
-                eval_metrics = None
+                eval_metrics = ema_eval_metrics
 
             if output_dir is not None:
                 lrs = [param_group['lr'] for param_group in optimizer.param_groups]
@@ -992,45 +867,24 @@ def main():
                     log_wandb=args.log_wandb and has_wandb,
                 )
 
-            if eval_metrics is not None:
-                latest_metric = eval_metrics[eval_metric]
-            else:
-                latest_metric = train_metrics[eval_metric]
-
             if saver is not None:
                 # save proper checkpoint with eval metric
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=latest_metric)
+                save_metric = eval_metrics[eval_metric]
+                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
 
             if lr_scheduler is not None:
                 if (args.sched == 'custom'):
                     lr_scheduler.step()
                 else:
                     # step LR for next epoch
-                    lr_scheduler.step(epoch + 1, latest_metric)
+                    lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
-            latest_results = {
-                'epoch': epoch,
-                'train': train_metrics,
-            }
-            if eval_metrics is not None:
-                latest_results['validation'] = eval_metrics
-            results.append(latest_results)
 
     except KeyboardInterrupt:
         pass
 
     if best_metric is not None:
-        # log best metric as tracked by checkpoint saver
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
-
-    if utils.is_primary(args):
-        # for parsable results display, dump top-10 summaries to avoid excess console spam
-        display_results = sorted(
-            results,
-            key=lambda x: x.get('validation', x.get('train')).get(eval_metric, 0),
-            reverse=decreasing_metric,
-        )
-        print(f'--result\n{json.dumps(display_results[-10:], indent=4)}')
 
 
 def train_one_epoch(
@@ -1046,10 +900,8 @@ def train_one_epoch(
         output_dir=None,
         amp_autocast=suppress,
         loss_scaler=None,
-        model_dtype=None,
         model_ema=None,
         mixup_fn=None,
-        num_updates_total=None,
 ):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -1083,7 +935,7 @@ def train_one_epoch(
             accum_steps = last_accum_steps
 
         if not args.prefetcher:
-            input, target = input.to(device=device, dtype=model_dtype), target.to(device=device)
+            input, target = input.to(device), target.to(device)
             if mixup_fn is not None:
                 input, target = mixup_fn(input, target)
         if args.channels_last:
@@ -1138,7 +990,8 @@ def train_one_epoch(
             loss = _forward()
             _backward(loss)
 
-        losses_m.update(loss.item() * accum_steps, input.size(0))
+        if not args.distributed:
+            losses_m.update(loss.item() * accum_steps, input.size(0))
         update_sample_count += input.size(0)
 
         if not need_update:
@@ -1148,13 +1001,10 @@ def train_one_epoch(
         num_updates += 1
         optimizer.zero_grad()
         if model_ema is not None:
-            model_ema.update(model, step=num_updates)
+            model_ema.update(model)
 
-        if args.synchronize_step:
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            elif device.type == 'npu':
-                torch.npu.synchronize()
+        if args.synchronize_step and device.type == 'cuda':
+            torch.cuda.synchronize()
         time_now = time.time()
         update_time_m.update(time.time() - update_start_time)
         update_start_time = time_now
@@ -1163,18 +1013,16 @@ def train_one_epoch(
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
 
-            loss_avg, loss_now = losses_m.avg, losses_m.val
             if args.distributed:
-                # synchronize current step and avg loss, each process keeps its own running avg
-                loss_avg = utils.reduce_tensor(loss.new([loss_avg]), args.world_size).item()
-                loss_now = utils.reduce_tensor(loss.new([loss_now]), args.world_size).item()
+                reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
+                losses_m.update(reduced_loss.item() * accum_steps, input.size(0))
                 update_sample_count *= args.world_size
 
             if utils.is_primary(args):
                 _logger.info(
                     f'Train: {epoch} [{update_idx:>4d}/{updates_per_epoch} '
-                    f'({100. * (update_idx + 1) / updates_per_epoch:>3.0f}%)]  '
-                    f'Loss: {loss_now:#.3g} ({loss_avg:#.3g})  '
+                    f'({100. * update_idx / (updates_per_epoch - 1):>3.0f}%)]  '
+                    f'Loss: {losses_m.val:#.3g} ({losses_m.avg:#.3g})  '
                     f'Time: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s  '
                     f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s)  '
                     f'LR: {lr:.3e}  '
@@ -1203,12 +1051,7 @@ def train_one_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    loss_avg = losses_m.avg
-    if args.distributed:
-        # synchronize avg loss, each process keeps its own running avg
-        loss_avg = torch.tensor([loss_avg], device=device, dtype=torch.float32)
-        loss_avg = utils.reduce_tensor(loss_avg, args.world_size).item()
-    return OrderedDict([('loss', loss_avg)])
+    return OrderedDict([('loss', losses_m.avg)])
 
 
 def validate(
@@ -1218,7 +1061,6 @@ def validate(
         args,
         device=torch.device('cuda'),
         amp_autocast=suppress,
-        model_dtype=None,
         log_suffix=''
 ):
     batch_time_m = utils.AverageMeter()
@@ -1234,8 +1076,8 @@ def validate(
         for batch_idx, (input, target) in enumerate(loader):
             last_batch = batch_idx == last_idx
             if not args.prefetcher:
-                input = input.to(device=device, dtype=model_dtype)
-                target = target.to(device=device)
+                input = input.to(device)
+                target = target.to(device)
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
@@ -1262,8 +1104,6 @@ def validate(
 
             if device.type == 'cuda':
                 torch.cuda.synchronize()
-            elif device.type == "npu":
-                torch.npu.synchronize()
 
             losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))

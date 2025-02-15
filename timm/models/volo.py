@@ -20,18 +20,16 @@ Modifications and additions for timm by / Copyright 2022, Ross Wightman
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import DropPath, Mlp, to_2tuple, to_ntuple, trunc_normal_, use_fused_attn
+from timm.layers import DropPath, Mlp, to_2tuple, to_ntuple, trunc_normal_
 from ._builder import build_model_with_cfg
-from ._features import feature_take_indices
-from ._manipulate import checkpoint
 from ._registry import register_model, generate_default_cfgs
 
 __all__ = ['VOLO']  # model_registry will add each entrypoint fn to this
@@ -121,24 +119,24 @@ class Outlooker(nn.Module):
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
         )
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(
             in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
+            hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
         )
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
-        x = x + self.drop_path1(self.attn(self.norm1(x)))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
 class Attention(nn.Module):
-    fused_attn: torch.jit.Final[bool]
 
     def __init__(
             self,
@@ -152,7 +150,6 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -165,19 +162,11 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
 
-        x = x.transpose(1, 2).reshape(B, H, W, C)
+        x = (attn @ v).transpose(1, 2).reshape(B, H, W, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -200,15 +189,17 @@ class Transformer(nn.Module):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop)
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
 
     def forward(self, x):
-        x = x + self.drop_path1(self.attn(self.norm1(x)))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -243,9 +234,8 @@ class ClassAttention(nn.Module):
 
         kv = self.kv(x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv.unbind(0)
-        q = self.q(x[:, :1, :]).reshape(B, self.num_heads, 1, self.head_dim) * self.scale
-
-        attn = q @ k.transpose(-2, -1)
+        q = self.q(x[:, :1, :]).reshape(B, self.num_heads, 1, self.head_dim)
+        attn = ((q * self.scale) @ k.transpose(-2, -1))
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -280,21 +270,21 @@ class ClassBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=drop,
         )
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
+        # NOTE: drop path for stochastic depth
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(
             in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
+            hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
             drop=drop,
         )
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
         cls_embed = x[:, :1]
-        cls_embed = cls_embed + self.drop_path1(self.attn(self.norm1(x)))
-        cls_embed = cls_embed + self.drop_path2(self.mlp(self.norm2(cls_embed)))
+        cls_embed = cls_embed + self.drop_path(self.attn(self.norm1(x)))
+        cls_embed = cls_embed + self.drop_path(self.mlp(self.norm2(cls_embed)))
         return torch.cat([cls_embed, x[:, 1:]], dim=1)
 
 
@@ -311,8 +301,8 @@ def rand_bbox(size, lam, scale=1):
     W = size[1] // scale
     H = size[2] // scale
     cut_rat = np.sqrt(1. - lam)
-    cut_w = (W * cut_rat).astype(int)
-    cut_h = (H * cut_rat).astype(int)
+    cut_w = np.int(W * cut_rat)
+    cut_h = np.int(H * cut_rat)
 
     # uniform
     cx = np.random.randint(W)
@@ -491,7 +481,7 @@ class VOLO(nn.Module):
         self.global_pool = global_pool
         self.mix_token = use_mix_token
         self.pooling_scale = pooling_scale
-        self.num_features = self.head_hidden_size = embed_dims[-1]
+        self.num_features = embed_dims[-1]
         if use_mix_token:  # enable token mixing, see token labeling for details.
             self.beta = 1.0
             assert global_pool == 'token', "return all tokens if mix_token is enabled"
@@ -505,18 +495,14 @@ class VOLO(nn.Module):
             hidden_dim=stem_hidden_dim,
             embed_dim=embed_dims[0],
         )
-        r = patch_size
 
-        # initial positional encoding, we add positional encoding after outlooker blocks
+        # inital positional encoding, we add positional encoding after outlooker blocks
         patch_grid = (img_size[0] // patch_size // pooling_scale, img_size[1] // patch_size // pooling_scale)
         self.pos_embed = nn.Parameter(torch.zeros(1, patch_grid[0], patch_grid[1], embed_dims[-1]))
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
 
         # set the main block in network
-        self.stage_ends = []
-        self.feature_info = []
         network = []
-        block_idx = 0
         for i in range(len(layers)):
             if outlook_attention[i]:
                 # stage 1
@@ -531,6 +517,7 @@ class VOLO(nn.Module):
                     attn_drop=attn_drop_rate,
                     norm_layer=norm_layer,
                 )
+                network.append(stage)
             else:
                 # stage 2
                 stage = transformer_blocks(
@@ -545,15 +532,11 @@ class VOLO(nn.Module):
                     attn_drop=attn_drop_rate,
                     norm_layer=norm_layer,
                 )
-            network.append(stage)
-            self.stage_ends.append(block_idx)
-            self.feature_info.append(dict(num_chs=embed_dims[i], reduction=r, module=f'network.{block_idx}'))
-            block_idx += 1
+                network.append(stage)
+
             if downsamples[i]:
                 # downsampling between two stages
                 network.append(Downsample(embed_dims[i], embed_dims[i + 1], 2))
-                r *= 2
-                block_idx += 1
 
         self.network = nn.ModuleList(network)
 
@@ -619,10 +602,10 @@ class VOLO(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             self.global_pool = global_pool
@@ -708,86 +691,6 @@ class VOLO(nn.Module):
         # return these: 1. class token, 2. classes from all feature tokens, 3. bounding box
         return x_cls, x_aux, (bbx1, bby1, bbx2, bby2)
 
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            indices: Optional[Union[int, List[int]]] = None,
-            norm: bool = False,
-            stop_early: bool = False,
-            output_fmt: str = 'NCHW',
-            intermediates_only: bool = False,
-    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
-
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            norm: Apply norm layer to all intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-        Returns:
-
-        """
-        assert output_fmt in ('NCHW',), 'Output format must be NCHW.'
-        intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
-        take_indices = [self.stage_ends[i] for i in take_indices]
-        max_index = self.stage_ends[max_index]
-
-        # forward pass
-        B, _, height, width = x.shape
-        x = self.patch_embed(x).permute(0, 2, 3, 1)  # B,C,H,W-> B,H,W,C
-
-        # step2: tokens learning in the two stages
-        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
-            network = self.network
-        else:
-            network = self.network[:max_index + 1]
-        for idx, block in enumerate(network):
-            if idx == 2:
-                # add positional encoding after outlooker blocks
-                x = x + self.pos_embed
-                x = self.pos_drop(x)
-            x = block(x)
-            if idx in take_indices:
-                if norm and idx >= 2:
-                    x_inter = self.norm(x)
-                else:
-                    x_inter = x
-                intermediates.append(x_inter.permute(0, 3, 1, 2))
-
-        if intermediates_only:
-            return intermediates
-
-        # NOTE not supporting return of class tokens
-        # step3: post network, apply class attention or not
-        B, H, W, C = x.shape
-        x = x.reshape(B, -1, C)
-        if self.post_network is not None:
-            x = self.forward_cls(x)
-        x = self.norm(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
-        max_index = self.stage_ends[max_index]
-        self.network = self.network[:max_index + 1]  # truncate blocks
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
-            self.post_network = nn.ModuleList()  # prune token blocks with head
-            self.reset_classifier(0, '')
-        return take_indices
-
     def forward_features(self, x):
         x = self.patch_embed(x).permute(0, 2, 3, 1)  # B,C,H,W-> B,H,W,C
 
@@ -825,12 +728,12 @@ class VOLO(nn.Module):
 
 
 def _create_volo(variant, pretrained=False, **kwargs):
-    out_indices = kwargs.pop('out_indices', 3)
+    if kwargs.get('features_only', None):
+        raise RuntimeError('features_only not implemented for Vision Transformer models.')
     return build_model_with_cfg(
         VOLO,
         variant,
         pretrained,
-        feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
         **kwargs,
     )
 
@@ -895,7 +798,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def volo_d1_224(pretrained=False, **kwargs) -> VOLO:
+def volo_d1_224(pretrained=False, **kwargs):
     """ VOLO-D1 model, Params: 27M """
     model_args = dict(layers=(4, 4, 8, 2), embed_dims=(192, 384, 384, 384), num_heads=(6, 12, 12, 12), **kwargs)
     model = _create_volo('volo_d1_224', pretrained=pretrained, **model_args)
@@ -903,7 +806,7 @@ def volo_d1_224(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d1_384(pretrained=False, **kwargs) -> VOLO:
+def volo_d1_384(pretrained=False, **kwargs):
     """ VOLO-D1 model, Params: 27M """
     model_args = dict(layers=(4, 4, 8, 2), embed_dims=(192, 384, 384, 384), num_heads=(6, 12, 12, 12), **kwargs)
     model = _create_volo('volo_d1_384', pretrained=pretrained, **model_args)
@@ -911,7 +814,7 @@ def volo_d1_384(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d2_224(pretrained=False, **kwargs) -> VOLO:
+def volo_d2_224(pretrained=False, **kwargs):
     """ VOLO-D2 model, Params: 59M """
     model_args = dict(layers=(6, 4, 10, 4), embed_dims=(256, 512, 512, 512), num_heads=(8, 16, 16, 16), **kwargs)
     model = _create_volo('volo_d2_224', pretrained=pretrained, **model_args)
@@ -919,7 +822,7 @@ def volo_d2_224(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d2_384(pretrained=False, **kwargs) -> VOLO:
+def volo_d2_384(pretrained=False, **kwargs):
     """ VOLO-D2 model, Params: 59M """
     model_args = dict(layers=(6, 4, 10, 4), embed_dims=(256, 512, 512, 512), num_heads=(8, 16, 16, 16), **kwargs)
     model = _create_volo('volo_d2_384', pretrained=pretrained, **model_args)
@@ -927,7 +830,7 @@ def volo_d2_384(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d3_224(pretrained=False, **kwargs) -> VOLO:
+def volo_d3_224(pretrained=False, **kwargs):
     """ VOLO-D3 model, Params: 86M """
     model_args = dict(layers=(8, 8, 16, 4), embed_dims=(256, 512, 512, 512), num_heads=(8, 16, 16, 16), **kwargs)
     model = _create_volo('volo_d3_224', pretrained=pretrained, **model_args)
@@ -935,7 +838,7 @@ def volo_d3_224(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d3_448(pretrained=False, **kwargs) -> VOLO:
+def volo_d3_448(pretrained=False, **kwargs):
     """ VOLO-D3 model, Params: 86M """
     model_args = dict(layers=(8, 8, 16, 4), embed_dims=(256, 512, 512, 512), num_heads=(8, 16, 16, 16), **kwargs)
     model = _create_volo('volo_d3_448', pretrained=pretrained, **model_args)
@@ -943,7 +846,7 @@ def volo_d3_448(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d4_224(pretrained=False, **kwargs) -> VOLO:
+def volo_d4_224(pretrained=False, **kwargs):
     """ VOLO-D4 model, Params: 193M """
     model_args = dict(layers=(8, 8, 16, 4), embed_dims=(384, 768, 768, 768), num_heads=(12, 16, 16, 16), **kwargs)
     model = _create_volo('volo_d4_224', pretrained=pretrained, **model_args)
@@ -951,7 +854,7 @@ def volo_d4_224(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d4_448(pretrained=False, **kwargs) -> VOLO:
+def volo_d4_448(pretrained=False, **kwargs):
     """ VOLO-D4 model, Params: 193M """
     model_args = dict(layers=(8, 8, 16, 4), embed_dims=(384, 768, 768, 768), num_heads=(12, 16, 16, 16), **kwargs)
     model = _create_volo('volo_d4_448', pretrained=pretrained, **model_args)
@@ -959,7 +862,7 @@ def volo_d4_448(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d5_224(pretrained=False, **kwargs) -> VOLO:
+def volo_d5_224(pretrained=False, **kwargs):
     """ VOLO-D5 model, Params: 296M
     stem_hidden_dim=128, the dim in patch embedding is 128 for VOLO-D5
     """
@@ -971,7 +874,7 @@ def volo_d5_224(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d5_448(pretrained=False, **kwargs) -> VOLO:
+def volo_d5_448(pretrained=False, **kwargs):
     """ VOLO-D5 model, Params: 296M
     stem_hidden_dim=128, the dim in patch embedding is 128 for VOLO-D5
     """
@@ -983,7 +886,7 @@ def volo_d5_448(pretrained=False, **kwargs) -> VOLO:
 
 
 @register_model
-def volo_d5_512(pretrained=False, **kwargs) -> VOLO:
+def volo_d5_512(pretrained=False, **kwargs):
     """ VOLO-D5 model, Params: 296M
     stem_hidden_dim=128, the dim in patch embedding is 128 for VOLO-D5
     """

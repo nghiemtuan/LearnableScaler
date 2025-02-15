@@ -3,17 +3,14 @@ import math
 import re
 from collections import defaultdict
 from itertools import chain
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterator, Tuple, Type, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn as nn
-
-from timm.layers import use_reentrant_ckpt
-
+from torch.utils.checkpoint import checkpoint
 
 __all__ = ['model_parameters', 'named_apply', 'named_modules', 'named_modules_with_params', 'adapt_input_conv',
-           'group_with_matcher', 'group_modules', 'group_parameters', 'flatten_modules', 'checkpoint_seq', 'checkpoint']
+           'group_with_matcher', 'group_modules', 'group_parameters', 'flatten_modules', 'checkpoint_seq']
 
 
 def model_parameters(model: nn.Module, exclude_head: bool = False):
@@ -186,35 +183,13 @@ def flatten_modules(
                 yield name, module
 
 
-def checkpoint(
-    function,
-    *args,
-    use_reentrant: Optional[bool] = None,
-    **kwargs,
-):
-    """ checkpoint wrapper fn
-
-    A thin wrapper around torch.utils.checkpoint.checkpoint to default
-    use_reentrant to False
-    """
-    if use_reentrant is None:
-        use_reentrant = use_reentrant_ckpt()
-
-    return torch.utils.checkpoint.checkpoint(
-        function,
-        *args,
-        use_reentrant=use_reentrant,
-        **kwargs,
-    )
-
-
 def checkpoint_seq(
         functions,
         x,
-        every: int = 1,
-        flatten: bool = False,
-        skip_last: bool = False,
-        use_reentrant: Optional[bool] = None,
+        every=1,
+        flatten=False,
+        skip_last=False,
+        preserve_rng_state=True
 ):
     r"""A helper function for checkpointing sequential models.
 
@@ -240,9 +215,10 @@ def checkpoint_seq(
         functions: A :class:`torch.nn.Sequential` or the list of modules or functions to run sequentially.
         x: A Tensor that is input to :attr:`functions`
         every: checkpoint every-n functions (default: 1)
-        flatten: flatten nn.Sequential of nn.Sequentials
-        skip_last: skip checkpointing the last function in the sequence if True
-        use_reentrant: Use re-entrant checkpointing
+        flatten (bool): flatten nn.Sequential of nn.Sequentials
+        skip_last (bool): skip checkpointing the last function in the sequence if True
+        preserve_rng_state (bool, optional, default=True):  Omit stashing and restoring
+            the RNG state during each checkpoint.
 
     Returns:
         Output of running :attr:`functions` sequentially on :attr:`*inputs`
@@ -251,9 +227,6 @@ def checkpoint_seq(
         >>> model = nn.Sequential(...)
         >>> input_var = checkpoint_seq(model, input_var, every=2)
     """
-    if use_reentrant is None:
-        use_reentrant = use_reentrant_ckpt()
-
     def run_function(start, end, functions):
         def forward(_x):
             for j in range(start, end + 1):
@@ -274,11 +247,7 @@ def checkpoint_seq(
     end = -1
     for start in range(0, num_checkpointed, every):
         end = min(start + every - 1, num_checkpointed - 1)
-        x = torch.utils.checkpoint.checkpoint(
-            run_function(start, end, functions),
-            x,
-            use_reentrant=use_reentrant,
-        )
+        x = checkpoint(run_function(start, end, functions), x, preserve_rng_state=preserve_rng_state)
     if skip_last:
         return run_function(end + 1, len(functions) - 1, functions)(x)
     return x

@@ -578,7 +578,7 @@ class HighResolutionNet(nn.Module):
         head_conv_bias = cfg.pop('head_conv_bias', True)
         if head == 'classification':
             # Classification Head
-            self.num_features = self.head_hidden_size = 2048
+            self.num_features = 2048
             self.incre_modules, self.downsamp_modules, self.final_layer = self._make_head(
                 pre_stage_channels,
                 conv_bias=head_conv_bias,
@@ -591,10 +591,10 @@ class HighResolutionNet(nn.Module):
             )
         else:
             if head == 'incre':
-                self.num_features = self.head_hidden_size = 2048
+                self.num_features = 2048
                 self.incre_modules, _, _ = self._make_head(pre_stage_channels, incre_only=True)
             else:
-                self.num_features = self.head_hidden_size = 256
+                self.num_features = 256
                 self.incre_modules = None
             self.global_pool = nn.Identity()
             self.head_drop = nn.Identity()
@@ -736,10 +736,10 @@ class HighResolutionNet(nn.Module):
         assert not enable, "gradient checkpointing not supported"
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.classifier
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.classifier = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
@@ -829,12 +829,12 @@ class HighResolutionNetFeatures(HighResolutionNet):
             **kwargs,
         )
         self.feature_info = FeatureInfo(self.feature_info, out_indices)
-        self._out_idx = {f['index'] for f in self.feature_info.get_dicts()}
+        self._out_idx = {i for i in out_indices}
 
     def forward_features(self, x):
         assert False, 'Not supported'
 
-    def forward(self, x) -> List[torch.Tensor]:
+    def forward(self, x) -> List[torch.tensor]:
         out = []
         x = self.conv1(x)
         x = self.bn1(x)
@@ -862,17 +862,12 @@ def _create_hrnet(variant, pretrained=False, cfg_variant=None, **model_kwargs):
         kwargs_filter = ('num_classes', 'global_pool')
         features_only = True
     cfg_variant = cfg_variant or variant
-
-    pretrained_strict = model_kwargs.pop(
-        'pretrained_strict',
-        not features_only and model_kwargs.get('head', 'classification') == 'classification'
-    )
     model = build_model_with_cfg(
         model_cls,
         variant,
         pretrained,
         model_cfg=cfg_cls[cfg_variant],
-        pretrained_strict=pretrained_strict,
+        pretrained_strict=not features_only,
         kwargs_filter=kwargs_filter,
         **model_kwargs,
     )
@@ -894,9 +889,7 @@ def _cfg(url='', **kwargs):
 
 
 default_cfgs = generate_default_cfgs({
-    'hrnet_w18_small.gluon_in1k': _cfg(hf_hub_id='timm/', interpolation='bicubic'),
     'hrnet_w18_small.ms_in1k': _cfg(hf_hub_id='timm/'),
-    'hrnet_w18_small_v2.gluon_in1k': _cfg(hf_hub_id='timm/', interpolation='bicubic'),
     'hrnet_w18_small_v2.ms_in1k': _cfg(hf_hub_id='timm/'),
     'hrnet_w18.ms_aug_in1k': _cfg(
         hf_hub_id='timm/',
@@ -922,58 +915,58 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def hrnet_w18_small(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w18_small(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w18_small', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w18_small_v2(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w18_small_v2(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w18_small_v2', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w18(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w18(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w18', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w30(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w30(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w30', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w32(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w32(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w32', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w40(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w40(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w40', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w44(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w44(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w44', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w48(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w48(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w48', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w64(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w64(pretrained=False, **kwargs):
     return _create_hrnet('hrnet_w64', pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w18_ssld(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w18_ssld(pretrained=False, **kwargs):
     kwargs.setdefault('head_conv_bias', False)
     return _create_hrnet('hrnet_w18_ssld', cfg_variant='hrnet_w18', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def hrnet_w48_ssld(pretrained=False, **kwargs) -> HighResolutionNet:
+def hrnet_w48_ssld(pretrained=False, **kwargs):
     kwargs.setdefault('head_conv_bias', False)
     return _create_hrnet('hrnet_w48_ssld', cfg_variant='hrnet_w48', pretrained=pretrained, **kwargs)
 

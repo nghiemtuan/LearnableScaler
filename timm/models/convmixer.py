@@ -1,8 +1,6 @@
 """ ConvMixer
 
 """
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
@@ -40,7 +38,7 @@ class ConvMixer(nn.Module):
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.num_features = self.head_hidden_size = dim
+        self.num_features = dim
         self.grad_checkpointing = False
 
         self.stem = nn.Sequential(
@@ -74,10 +72,10 @@ class ConvMixer(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             self.pooling = SelectAdaptivePool2d(pool_type=global_pool, flatten=True)
@@ -103,9 +101,6 @@ class ConvMixer(nn.Module):
 
 
 def _create_convmixer(variant, pretrained=False, **kwargs):
-    if kwargs.get('features_only', None):
-        raise RuntimeError('features_only not implemented for ConvMixer models.')
-
     return build_model_with_cfg(ConvMixer, variant, pretrained, **kwargs)
 
 
@@ -129,18 +124,18 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def convmixer_1536_20(pretrained=False, **kwargs) -> ConvMixer:
+def convmixer_1536_20(pretrained=False, **kwargs):
     model_args = dict(dim=1536, depth=20, kernel_size=9, patch_size=7, **kwargs)
     return _create_convmixer('convmixer_1536_20', pretrained, **model_args)
 
 
 @register_model
-def convmixer_768_32(pretrained=False, **kwargs) -> ConvMixer:
+def convmixer_768_32(pretrained=False, **kwargs):
     model_args = dict(dim=768, depth=32, kernel_size=7, patch_size=7, act_layer=nn.ReLU, **kwargs)
     return _create_convmixer('convmixer_768_32', pretrained, **model_args)
 
 
 @register_model
-def convmixer_1024_20_ks9_p14(pretrained=False, **kwargs) -> ConvMixer:
+def convmixer_1024_20_ks9_p14(pretrained=False, **kwargs):
     model_args = dict(dim=1024, depth=20, kernel_size=9, patch_size=14, **kwargs)
     return _create_convmixer('convmixer_1024_20_ks9_p14', pretrained, **model_args)

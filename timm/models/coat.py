@@ -7,7 +7,8 @@ Official CoaT code at: https://github.com/mlpc-ucsd/CoaT
 
 Modified from timm/models/vision_transformer.py
 """
-from typing import List, Optional, Tuple, Union
+from functools import partial
+from typing import Tuple, List, Union
 
 import torch
 import torch.nn as nn
@@ -380,7 +381,7 @@ class CoaT(nn.Module):
         self.return_interm_layers = return_interm_layers
         self.out_features = out_features
         self.embed_dims = embed_dims
-        self.num_features = self.head_hidden_size = embed_dims[-1]
+        self.num_features = embed_dims[-1]
         self.num_classes = num_classes
         self.global_pool = global_pool
 
@@ -556,10 +557,10 @@ class CoaT(nn.Module):
         return matcher
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('token', 'avg')
@@ -689,11 +690,8 @@ def checkpoint_filter_fn(state_dict, model):
     for k, v in state_dict.items():
         # original model had unused norm layers, removing them requires filtering pretrained checkpoints
         if k.startswith('norm1') or \
-                (k.startswith('norm2') and getattr(model, 'norm2', None) is None) or \
-                (k.startswith('norm3') and getattr(model, 'norm3', None) is None) or \
-                (k.startswith('norm4') and getattr(model, 'norm4', None) is None) or \
-                (k.startswith('aggregate') and getattr(model, 'aggregate', None) is None) or \
-                (k.startswith('head') and getattr(model, 'head', None) is None):
+                (model.norm2 is None and k.startswith('norm2')) or \
+                (model.norm3 is None and k.startswith('norm3')):
             continue
         out_dict[k] = v
     return out_dict
@@ -740,7 +738,7 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def coat_tiny(pretrained=False, **kwargs) -> CoaT:
+def coat_tiny(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=4, embed_dims=[152, 152, 152, 152], serial_depths=[2, 2, 2, 2], parallel_depth=6)
     model = _create_coat('coat_tiny', pretrained=pretrained, **dict(model_cfg, **kwargs))
@@ -748,7 +746,7 @@ def coat_tiny(pretrained=False, **kwargs) -> CoaT:
 
 
 @register_model
-def coat_mini(pretrained=False, **kwargs) -> CoaT:
+def coat_mini(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=4, embed_dims=[152, 216, 216, 216], serial_depths=[2, 2, 2, 2], parallel_depth=6)
     model = _create_coat('coat_mini', pretrained=pretrained, **dict(model_cfg, **kwargs))
@@ -756,7 +754,7 @@ def coat_mini(pretrained=False, **kwargs) -> CoaT:
 
 
 @register_model
-def coat_small(pretrained=False, **kwargs) -> CoaT:
+def coat_small(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=4, embed_dims=[152, 320, 320, 320], serial_depths=[2, 2, 2, 2], parallel_depth=6, **kwargs)
     model = _create_coat('coat_small', pretrained=pretrained, **dict(model_cfg, **kwargs))
@@ -764,7 +762,7 @@ def coat_small(pretrained=False, **kwargs) -> CoaT:
 
 
 @register_model
-def coat_lite_tiny(pretrained=False, **kwargs) -> CoaT:
+def coat_lite_tiny(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=4, embed_dims=[64, 128, 256, 320], serial_depths=[2, 2, 2, 2], mlp_ratios=[8, 8, 4, 4])
     model = _create_coat('coat_lite_tiny', pretrained=pretrained, **dict(model_cfg, **kwargs))
@@ -772,7 +770,7 @@ def coat_lite_tiny(pretrained=False, **kwargs) -> CoaT:
 
 
 @register_model
-def coat_lite_mini(pretrained=False, **kwargs) -> CoaT:
+def coat_lite_mini(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=4, embed_dims=[64, 128, 320, 512], serial_depths=[2, 2, 2, 2], mlp_ratios=[8, 8, 4, 4])
     model = _create_coat('coat_lite_mini', pretrained=pretrained, **dict(model_cfg, **kwargs))
@@ -780,7 +778,7 @@ def coat_lite_mini(pretrained=False, **kwargs) -> CoaT:
 
 
 @register_model
-def coat_lite_small(pretrained=False, **kwargs) -> CoaT:
+def coat_lite_small(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=4, embed_dims=[64, 128, 320, 512], serial_depths=[3, 4, 6, 3], mlp_ratios=[8, 8, 4, 4])
     model = _create_coat('coat_lite_small', pretrained=pretrained, **dict(model_cfg, **kwargs))
@@ -788,7 +786,7 @@ def coat_lite_small(pretrained=False, **kwargs) -> CoaT:
 
 
 @register_model
-def coat_lite_medium(pretrained=False, **kwargs) -> CoaT:
+def coat_lite_medium(pretrained=False, **kwargs):
     model_cfg = dict(
         patch_size=4, embed_dims=[128, 256, 320, 512], serial_depths=[3, 6, 10, 8])
     model = _create_coat('coat_lite_medium', pretrained=pretrained, **dict(model_cfg, **kwargs))
@@ -796,7 +794,7 @@ def coat_lite_medium(pretrained=False, **kwargs) -> CoaT:
 
 
 @register_model
-def coat_lite_medium_384(pretrained=False, **kwargs) -> CoaT:
+def coat_lite_medium_384(pretrained=False, **kwargs):
     model_cfg = dict(
         img_size=384, patch_size=4, embed_dims=[128, 256, 320, 512], serial_depths=[3, 6, 10, 8])
     model = _create_coat('coat_lite_medium_384', pretrained=pretrained, **dict(model_cfg, **kwargs))
