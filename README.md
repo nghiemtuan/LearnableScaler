@@ -20,15 +20,15 @@ The following table shows the effect of LearnableScaler with deep Transformers:
 |__vit(patch, embed dim, depth, norm)__| ImageNet1k acc. | ImageNet-V2 acc. | Pre-train weight |
 |--------------------------------------|-----------------|------------------|------------------|
 |vit(16, 192, 24, LayerNorm)           | 77.14           | 64.9             |
-|vit(16, 192, 24, LearnableScaler)     | 78.77           | 67.02            |
+|vit(16, 192, 24, LearnableScaler)     | __78.77__           | __67.02__            |
 |vit(16, 192, 36, LayerNorm)           | 76.2            | ??               |
-|vit(16, 192, 36, LearnableScaler)     | 79.77           | 68.21            |[checkpoint](https://drive.google.com/file/d/1jVEP0IAzJO2MMGRe26rHLixfgB2W_eQv/view?usp=drive_link)|
+|vit(16, 192, 36, LearnableScaler)     | __79.77__           | __68.21__            |[checkpoint](https://drive.google.com/file/d/1jVEP0IAzJO2MMGRe26rHLixfgB2W_eQv/view?usp=drive_link)|
 |vit(16, 288, 24, LayerNorm)           | 78.2            | 65.71            |                   |
-|vit(16, 288, 24, LearnableScaler)     | 79.72           | 68.16            |[checkpoint](https://drive.google.com/file/d/1YcKPs9Q3MeebsR2WRvH0oQCBaqRpOfHO/view?usp=drive_link)|
+|vit(16, 288, 24, LearnableScaler)     | __79.72__           | __68.16__            |[checkpoint](https://drive.google.com/file/d/1YcKPs9Q3MeebsR2WRvH0oQCBaqRpOfHO/view?usp=drive_link)|
 |vit(32, 288, 24, LayerNorm)           | 69.93           | 55.81            |                   |
-|vit(32, 288, 24, LearnableScaler)     | 74.53           | 60.82            |                   |
+|vit(32, 288, 24, LearnableScaler)     | __74.53__           | 60.82            |                   |
 |vit(32, 288, 36, LayerNorm)           | 67.86           | 53.35            |                   |
-|vit(32, 288, 36, LearnableScaler)     | 75.71           | 62.76            |                   |
+|vit(32, 288, 36, LearnableScaler)     | __75.71__           | __62.76__            |                   |
 
 
 
