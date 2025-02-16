@@ -1,10 +1,20 @@
 # LearnableScaler
+
 LearnableScaler, a possible replacement for normalization methods such as LayerNorm, BatchNorm, RMS norm etc. in neural networks.
+
+
 ##Introduction:
+
+
 Normalization techniques like LayerNorm and BatchNorm are employed to mitigate the risk of overflow during the training of neural networks. Nonetheless, these methods may inadvertently lead to a decrease in the model's generalization performance on unseen (testing) data.
 
 LearnableScaler is proposed as a replacement for those normalization methods in neural networks. Compared with the former methods, it is faster and doesn't affect generalization ability of neural networks as much as LayerNorm or BatchNorm. For example, in the experiment with Vision Transformer model having 36 layers, just by replacing LayerNorm with LearnableScaler, the testing accuracy increases 3.4 % (from 76.32% to 79.77%). A detailed explanation of LearnableScaler will be presented in a blog post.
-##Benchmark
+
+
+
+## Benchmark
+
+
 The following table shows the effect of LearnableScaler with deep Transformers:
 
 |__vit(patch, embed dim, depth, norm)__| ImageNet1k acc. | ImageNet-V2 acc. | Pre-train weight |
@@ -22,7 +32,9 @@ The following table shows the effect of LearnableScaler with deep Transformers:
 
 
 
-##Code
+## Code
+
+
 To use LearnableScaler, just replace LayerNorm in Transformer with this code:
 ```
 class LearnableScaler(nn.Module):
@@ -36,7 +48,10 @@ class LearnableScaler(nn.Module):
         return self.a[None,None,:] * x + self.b[None, None,:]
 ```
 Here `x` has the format `b n d`.
+
+
 To use LearnableScaler, just replace BatchNorm in CNN with this code:
+
 ```
 class LearnableScaler2d(nn.Module):
     def __init__(self, num_channels, eps=1e-6, affine=True):
@@ -47,9 +62,15 @@ class LearnableScaler2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.a[None,:,None,None] * x + self.b[None,:, None, None]
 ```
+
 Here `x` has the format `b c h w`.
-When training networks using LearnableScaler, there are several important points to consider. Firstly, to train those networks, one should use smaller learning rate than the one used to train networks with LayerNorm or BatchNorm. Secondly, the number of training epochs should be long enough so that the networks should have enough time to learn small details of training data. Finally, LearnableScaler would be more suitable for deep networks than the shallow ones.
-##Training:
+
+When training networks using LearnableScaler, there are several important points to consider. Firstly, to train those networks, one should use smaller learning rate than the one used to train networks with LayerNorm or BatchNorm. For example, if the learning rate for networks with LayerNorm is 0.005, the learning rate for networks with LearnableScaler should be 0.003-0.004. Secondly, the number of training epochs should be long enough so that the networks should have enough time to learn small details of training data. Finally, LearnableScaler would be more suitable for deep networks than the shallow ones.
+
+
+## Training / Validating:
+
+
 The training protocol is the one in [this paper](https://arxiv.org/abs/2110.00476)
 To replicate the training result, run:
 ```
